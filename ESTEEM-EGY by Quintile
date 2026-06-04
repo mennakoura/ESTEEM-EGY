@@ -181,7 +181,7 @@ end
 # =============================================================================
 # 4) LES CALIBRATION
 # =============================================================================
-cQ      = hcat([CQ[:, h] ./ POPQ[h] for h in 1:H]...).  # per-capita consumption
+cQ      = hcat([CQ[:, h] ./ POPQ[h] for h in 1:H]...)   # per-capita consumption
 YDreal0 = YDH_h ./ (POPQ .* pCQ)                        # real per-capita disposable income
 
 C0_SH   = Float64.(EGYHH["Subsistence (c0_SH)"]["I4:M70"])  # subsistence shares (Breisinger/IFPRI)
