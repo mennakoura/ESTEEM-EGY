@@ -257,15 +257,3 @@ The console "VERIFICATION OUTPUT" section prints every quintile-level ratio at t
 
 Ten sectors have under-populated intermediate-input columns in the CAPMAS table, producing artefactually high markups and exaggerated own-sector responses (most visibly the −67% collapse in Wood products). They are **retained for Leontief consistency** but flagged and excluded from substantive interpretation. The script comment (≈ line 981) lists them as sectors **3, 11, 13, 27, 28, 34, 37, 47, 52, 65**. They account for ≈ 4% of GDP and appear sparsely in the IO matrix, so they do not propagate materially into aggregate or quintile-level outcomes.
 
----
-
-## 12. Reproducibility checklist
-
-- [ ] Workbook `ESTEEM-EGY ModelSheets.xlsx` is in the same folder as the script and its name matches line 14.
-- [ ] Sheets present with expected names — including `Own-Price Elasticities (ηxh)` and `Subsistence (c0_SH)` — so no renaming is needed for this workbook.
-- [ ] Subsistence read `["Subsistence (c0_SH)"]["I4:M70"]` returns a 67×5 numeric grid; confirm `size(C0_SH) == (67,5)`.
-- [ ] Julia packages installed.
-- [ ] Baseline checks pass: output/CPI/income flat; S=I residual ≈ 1e-10; LES `max|CQ − Ctarg0| ≈ 0`; `tY[14]: −0.316 → −0.060`.
-- [ ] Scenario console output matches Table 9.5 / 9.6; sensitivity grid reports 15/15 cells below baseline.
-
-Once these pass, every figure and table in Chapters 7–9 regenerates from a single run.
