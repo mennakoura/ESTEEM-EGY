@@ -1,6 +1,6 @@
 # ESTEEM-Egypt — Replication Package Documentation
 
-**Thesis:** Egypt's Fuel Subsidy Reform and the Distributional Adequacy of Takaful and Karama Cash Transfers
+**Thesis:** Reform Under IMF Conditionality: An ESTEEM-Based Dynamic Input-Output Analysis of Fuel Subsidy Removal in Egypt
 **Model:** ESTEEM-Egypt — a 67-sector, 5-quintile dynamic input–output model adapted from Magacho & Spinola (2025)
 **Author:** Menna Koura
 
