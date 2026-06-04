@@ -1,0 +1,1774 @@
+using Plots, DifferentialEquations, LinearAlgebra, XLSX, ModelingToolkit, Printf
+
+##############################################################
+### ESTEEM Egypt - 67 Sectors, 5 Household Quintiles       ###
+### Consumption: Linear Expenditure System                 ###
+### Shock: Fuel subsidy removal + targeted cash transfer   ###
+##############################################################
+
+# =============================================================================
+# 0) LOAD AND CLEAN IO DATA
+# =============================================================================
+
+path = pwd()
+EGYHH = XLSX.readxlsx(string(path, "/ESTEEM-EGY ModelSheets.xlsx"))
+
+clean(x) = x isa Number ? Float64(x) :
+           (x isa String ? parse(Float64, replace(strip(x), "," => ".")) : 0.0)
+
+ZZ     = clean.(EGYHH["IO"]["C6:BQ72"])
+cc     = vec(clean.(EGYHH["IO"]["BS6:BS72"]) .+ clean.(EGYHH["IO"]["BW6:BW72"]))
+xx     = vec(clean.(EGYHH["IO"]["CE6:CE72"]))
+iK     = vec(clean.(EGYHH["IO"]["BY6:BY72"]))
+gg     = vec(clean.(EGYHH["IO"]["BV6:BV72"]))
+mm     = vec(clean.(EGYHH["IO"]["CG6:CG72"]))
+nn     = vec(clean.(EGYHH["IO"]["C85:BQ85"]))
+nn[nn .== 0] .= 1.0                            # guard against zero employment (division safety)
+tY_raw = vec(clean.(EGYHH["IO"]["C78:BQ78"])) .- vec(clean.(EGYHH["IO"]["C79:BQ79"])) # Actually production tax less production subsidies
+WW_sec = vec(clean.(EGYHH["IO"]["C77:BQ77"]))
+
+# =============================================================================
+# 1) AGGREGATE IO QUANTITIES AND PRICES
+# =============================================================================
+
+N = length(cc)   # 67 sectors
+H = 5            # quintiles
+
+yA     = vec(sum(ZZ, dims=2)) .+ cc .+ gg .+ iK
+sigmaM = mm ./ yA
+sigmaM[.!isfinite.(sigmaM)] .= 0.0
+yy     = (1 .- sigmaM) .* yA .+ xx
+AA     = ZZ * inv(diagm(yy))
+
+# Tax RATES 
+tY = tY_raw ./ (yy .+ mm)       # net tax on products rate 
+tM = zeros(N)                   # import tariff rates set to zero
+tY[.!isfinite.(tY)] .= 0.0      # fix any division by zeros
+
+pf      = (1 .+ tY) .* ((1 .- sigmaM) .+ sigmaM .* (1 .+ tM))
+pC_base = sum(cc .* pf) / sum(cc)
+ww      = WW_sec ./ yy
+mu0     = vec(1 ./ (AA' * pf .+ ww) .- 1)
+GOS_sec = (1 .- AA' * pf .- ww) .* yy
+
+# Trade elasticities 
+# Source: Eldeep & Zaki (2023)
+# Range: σM ∈ [0.9,2.4], σX ∈ [1.5,3.0] 
+ηᴹ_vec = vec(Float64.(EGYHH["Trade Elasticities EZ"]["E3:E69"]))  # η^M → imports
+ηˣ_vec = vec(Float64.(EGYHH["Trade Elasticities EZ"]["G3:G69"]))  # η^X → exports
+ζˣ_vec = xx ./ max.(1 .+ tY, 1e-4).^ηˣ_vec   
+ζᴹ_vec = sigmaM .* max.(1 .+ tM, 1e-4).^(-ηᴹ_vec) 
+
+# --- Additional calibration checks ---
+println("mu0 range: ", round(minimum(mu0), digits=4), " to ", round(maximum(mu0), digits=4))
+println("Negative mu0 sectors: ", sum(mu0 .< 0))
+println("w initial range: ", round(minimum(WW_sec ./ nn), digits=2),
+        " to ", round(maximum(WW_sec ./ nn), digits=2))
+println("Any non-finite w: ", sum(.!isfinite.(WW_sec ./ nn)))
+
+# ── mu0 diagnostic ────────────────────────────────────────────────────────
+println("\n=== mu0 diagnostics ===")
+println("Max mu0: ", round(maximum(mu0), digits=2), 
+        "  Min mu0: ", round(minimum(mu0), digits=2))
+println("Sectors with mu0 > 5:")
+for i in 1:N
+    if mu0[i] > 5
+        println("  Sector $i: mu0=$(round(mu0[i],digits=2))",
+                "  AA'pf=$(round((AA'*pf)[i],digits=4))",
+                "  ww=$(round(ww[i],digits=4))",
+                "  yy=$(round(yy[i]/1e6,digits=1)) bn EGP")
+    end
+end
+
+println("Sectors with mu0 < -0.3:")
+for i in 1:N
+    if mu0[i] < -0.3
+        println("  Sector $i: mu0=$(round(mu0[i],digits=2))",
+                "  AA'pf=$(round((AA'*pf)[i],digits=4))",
+                "  ww=$(round(ww[i],digits=4))")
+    end
+end
+
+# more checks before proceeding
+println("pf range: ", round(minimum(pf), digits=4), " to ", round(maximum(pf), digits=4),
+        "  (reflects tax/subsidy structure — values below 1 indicate subsidised sectors)")
+println("pC: ", round(pC_base, digits=4), "  (aggregate CPI including tax/subsidy distortions)")
+println("GOS_sec sum: ", round(sum(GOS_sec) / 1e6, digits=1), " bn EGP")
+println("GOS negative sectors: ", sum(GOS_sec .< 0))
+
+# =============================================================================
+# 2) HOUSEHOLD QUINTILE DATA
+# =============================================================================
+# CQ        : total consumption by sector × quintile (67×5, thousands EGP)
+# POPQ      : population by quintile (thousands), equal quintiles ~20,329 each
+# THETAW    : wage shares (sector × quintile), each row sums to 1
+# DISW      : raw wage payments (sector × quintile), kept for profit-distribution scaling
+# APIQ      : profit ownership shares by quintile 
+# SCQ       : social contribution rates by quintile (fractions of wage income)
+# ETA_own   : own-price elasticities by sector × quintile (from Breisinger et al., 2018)
+# =============================================================================
+
+CQ         = Float64.(EGYHH["CQ"]["B2:F68"])
+POPQ       = vec(Float64.(EGYHH["POPQ"]["A2:E2"]))
+THETAW_raw = Float64.(EGYHH["THETAW"]["B2:F68"])
+row_sums_w = sum(THETAW_raw, dims=2)     # total wages paid by each sector (across quintiles)
+row_sums_w[row_sums_w .== 0] .= 1.0      # to avoid division by zero
+THETAW     = THETAW_raw ./ row_sums_w    
+
+DISW       = THETAW_raw                  
+APIQ       = vec(Float64.(EGYHH["APIQ"]["B5:F5"]))
+SCQ        = vec(Float64.(EGYHH["SCQ"]["A8:E8"]))
+
+ETA_own    = Float64.(EGYHH["Own-Price Elasticities (ηxh)"]["C2:G68"]) 
+println("Own-price elasticity sector 14 (petroleum): ", round.(ETA_own[14,:], digits=4))
+
+# =============================================================================
+# 2b) DERIVE THETAPI — sector × quintile profit distribution
+# =============================================================================
+
+APIQPERC = APIQ ./ sum(APIQ) # normalizing APIQ to shares summing to 1 (unnecessary)
+
+# First-pass profit distribution: every sector uses the same quintile-split key APIQPERC
+DISPI    = GOS_sec * APIQPERC'
+scaling  = (sum(DISPI, dims=1) ./ sum(DISPI)) ./ (sum(DISW, dims=1) ./ sum(DISW))  # wage-scaling correction to hh profit distribution 
+THETAPI  = THETAW .* scaling                 # rescale wage shares
+THETAPI ./= sum(THETAPI, dims=2)             # renormalise rows to sum to 1
+THETAPI[.!isfinite.(THETAPI)] .= 1.0 / H     # fix any zero-wage rows
+
+# final profit distribution
+DISPI    = GOS_sec .* THETAPI
+DPI      = vec(sum(DISPI, dims=1))           # total profit income by quintile (length H)
+
+println("=== Income distribution checks ===")
+println("Total GOS:        ", round(sum(GOS_sec)/1e6, digits=1), " bn EGP")
+println("Total DPI:        ", round(sum(DPI)/1e6,     digits=1), " bn EGP")
+println("DPI by quintile:  ", round.(DPI ./ 1e6,      digits=1), " bn EGP")
+println("THETAW row sums:  ", extrema(sum(THETAW,  dims=2)))  # should be (1,1)
+println("THETAPI row sums: ", extrema(sum(THETAPI, dims=2)))  # should be (1,1)
+
+# =============================================================================
+# 3) QUINTILE-LEVEL INCOME AND PRICE CALIBRATION
+# =============================================================================
+
+DW    = vec(THETAW' * WW_sec)                              # Wage income by quintile
+YDH_h = ((1 .- SCQ) .* DW) .+ DPI                          # Disposable income per quintile
+pCQ   = [ (CQ[:, h]' * pf) / sum(CQ[:, h]) for h in 1:H ]  # CPI by quintile
+
+println("\n=== Quintile income checks ===")
+println("DW  (wage income, bn EGP):        ", round.(DW  ./ 1e6, digits=1))
+println("DPI (profit income, bn EGP):      ", round.(DPI ./ 1e6, digits=1))
+println("YDH (disposable income, bn EGP):  ", round.(YDH_h ./ 1e6, digits=1))
+println("pCQ (quintile CPI, base≈1):       ", round.(pCQ, digits=4))
+println("Aggregate CPI check: ", round(pC_base, digits=4),
+        " vs weighted pCQ: ",
+        round(sum(pCQ[h] * sum(CQ[:,h]) for h in 1:H) / sum(cc), digits=4))
+
+println("\n=== Units consistency check ===")
+println("Sum of cc  (IOT HH consumption):  ", round(sum(cc)/1e6,  digits=1), " bn EGP")
+println("Sum of CQ  (all quintiles total): ", round(sum(CQ)/1e6,  digits=1), " bn EGP")
+println("Sum DW+DPI (total factor income): ", round((sum(DW)+sum(DPI))/1e6, digits=1), " bn EGP")
+println("Ratio DW+DPI / CQ (should be ~1.2-1.5 for savings): ",
+        round((sum(DW)+sum(DPI)) / sum(CQ), digits=3))
+println()
+for h in 1:H
+    cons_h    = sum(CQ[:, h])
+    savings_h = 1 - cons_h / YDH_h[h]
+    println("Q$h: YDH=", round(YDH_h[h]/1e6, digits=1),
+            " bn  CQ=",  round(cons_h/1e6,    digits=1),
+            " bn  implied savings rate=", round(savings_h*100, digits=1), "%")
+end
+
+# =============================================================================
+# 4) LES CALIBRATION
+# =============================================================================
+cQ      = hcat([CQ[:, h] ./ POPQ[h] for h in 1:H]...).  # per-capita consumption
+YDreal0 = YDH_h ./ (POPQ .* pCQ)                        # real per-capita disposable income
+
+C0_SH   = Float64.(EGYHH["Subsistence (c0_SH)"]["I4:M70"])  # subsistence shares (Breisinger/IFPRI)
+c0Q     = C0_SH .* cQ                                       # per-capita subsistence by (sector, quintile)
+c0Q_tot = vec(sum(c0Q, dims=1))                             # total subsistence per capita by quintile
+
+c1Q = zeros(N, H)                                          
+for h in 1:H
+    price_adj = (pf ./ pCQ[h]) .^ ETA_own[:, h]
+    price_adj[.!isfinite.(price_adj)] .= 1.0
+    price_adj[price_adj .== 0] .= 1.0
+    denom = (YDreal0[h] .- c0Q_tot[h]) .* price_adj
+    denom[abs.(denom) .< 1e-10] .= 1e-10
+    c1Q[:, h] = (cQ[:, h] .- c0Q[:, h]) ./ denom
+end
+
+price_adj_check = hcat([((pf ./ pCQ[h]) .^ ETA_own[:, h]) for h in 1:H]...)
+price_adj_check[.!isfinite.(price_adj_check)] .= 1.0
+Ctarg0 = POPQ' .* (c0Q .+ c1Q .* repeat((YDreal0 .- c0Q_tot)', N, 1) .* price_adj_check)
+
+println("Aggregate subsistence share (%): ",
+        round.(c0Q_tot ./ vec(sum(cQ,dims=1)) .* 100, digits=1))
+println("Discretionary income (YD-c0Q_tot): ",
+        round.(YDreal0 .- c0Q_tot, digits=2))
+println("\n=== LES calibration checks ===")
+println("Negative c0Q: ", sum(c0Q .< 0))
+println("Negative c1Q: ", sum(c1Q .< 0))
+println("c1Q column sums: ", round.(vec(sum(c1Q, dims=1)), digits=4))
+println("max |CQ - Ctarg0| (must be ≈ 0): ", round(maximum(abs.(CQ .- Ctarg0)), digits=2))
+
+# =============================================================================
+# 5) DEFINE THE SYMBOLIC SYSTEM
+# =============================================================================
+
+@parameters βᶜ, βʷ, 
+    βʸ[1:N], βᵖ[1:N],
+    μ₁, γⁿ, λⁿ, nᵃ, eᴺ,
+    ηˣ[1:N], ηᴹ[1:N],
+    ζˣ[1:N], ζᴹ[1:N], pᵂ[1:N],
+    A[1:N, 1:N], vᵈ[1:N], μ₀[1:N], a[1:N],
+    g[1:N], iᴷ[1:N],
+    tʸ[1:N], tᴹ[1:N],
+    c⁰[1:N, 1:H], c¹[1:N, 1:H],
+    cᵇ[1:N],
+    cᵇʰ[1:N, 1:H],
+    Popᴴ[1:H],
+    Θʷ[1:N, 1:H],
+    Θᵖ[1:N, 1:H],
+    scᴴ[1:H],
+    ηᴴ[1:N, 1:H],    # own-price elasticity by sector × quintile (Breisinger et al., 2018)
+    στᴴ[1:H],        # transfer distribution weights by quintile
+    στˢ,             # transfer size: fraction of GDP (δˢ=0) or fraction of extra revenue (δˢ=1)
+    δˢ,              # fiscal saving mode: 1 = dynamic saving, 0 = fixed % GDP
+    tʸʳᵉᶠ[1:N]       # reference (pre-shock) tax rates
+
+@variables t,
+    # Sector-level
+    (yᴰ[1:N])(t), (y[1:N])(t), (yᵉ[1:N])(t), (yᴬ[1:N])(t),
+    (v[1:N])(t),
+    (x[1:N])(t), (σᴹ[1:N])(t), (m[1:N])(t),
+    (μ[1:N])(t), (pᵇ[1:N])(t), (pᵈ[1:N])(t), (pᶠ[1:N])(t),
+    (w[1:N])(t), (wᵈ[1:N])(t), (n[1:N])(t),
+    (cₐ[1:N])(t),
+    # Household-level (N×H matrices)
+    (Cᴴ[1:N, 1:H])(t),
+    (Wᴴ[1:H])(t),
+    (Πᴴ[1:H])(t),
+    (YDᴴ[1:H])(t),
+    (pᶜᴴ[1:H])(t),
+    # Aggregates
+    (W)(t), (Π)(t), (YD)(t),
+    (Tʸ)(t), (Tᴹ)(t), (SC)(t),
+    NX(t), SG(t), SP(t),
+    pᶜ(t), πₜ(t), yₜ(t), gₜ(t), gʸ(t), πʸ(t), nₜ(t), GDP(t), Invₜ(t),
+   
+    (ST)(t),        # aggregate social transfer
+    (STᴴ[1:H])(t)   # social transfer by quintile (distributed by population share)
+
+D = Differential(t)
+
+eqs = vcat(
+
+    # =========================================================================
+    # PRODUCTIVE DYNAMICS
+    # =========================================================================
+    Symbolics.scalarize(yᴰ ~ yᴬ + x - m),
+    Symbolics.scalarize(y  ~ yᵉ + vᵈ - v),
+    Symbolics.scalarize(D.(v)  ~ y - yᴰ),
+    Symbolics.scalarize(D.(yᵉ) ~ βʸ .* (yᴰ - yᵉ)),
+    # Absorption = intermediate + government + investment + total HH consumption
+    Symbolics.scalarize(yᴬ ~ A * y + cₐ + g + iᴷ),
+    Symbolics.scalarize(cₐ ~ Cᴴ * ones(H)),
+
+    # =========================================================================
+    # TRADE DYNAMICS
+    # =========================================================================
+    Symbolics.scalarize(x ~ ζˣ .* max.(pᵇ .* (1 .+ tʸ) ./ (pᵂ * eᴺ), 1e-8).^ηˣ),
+    Symbolics.scalarize(σᴹ ~ ζᴹ .* max.(pᵇ ./ (pᵂ .* (1 .+ tᴹ) * eᴺ), 1e-8).^(-ηᴹ)),
+    Symbolics.scalarize(m  ~ σᴹ .* yᴬ),
+
+    # =========================================================================
+    # HOUSEHOLD INCOME DISTRIBUTION
+    # =========================================================================
+    vec(Symbolics.scalarize(Wᴴ ~ Θʷ' * (w .* n))),
+    vec(Symbolics.scalarize(Πᴴ ~ Θᵖ' * ((pᵇ - A' * pᶠ - w ./ a) .* y))),
+    W  ~ sum(w .* n),
+    Π  ~ sum((pᵇ - A' * pᶠ - w ./ a) .* y),
+    YD ~ W + Π,
+
+    # =========================================================================
+    # LES CONSUMPTION DYNAMICS 
+    # =========================================================================
+    # Step 1: quintile-specific CPI
+    vec(Symbolics.scalarize(pᶜᴴ ~ (cᵇʰ' * pᶠ) ./ vec(sum(cᵇʰ, dims=1)))),
+
+    # Step 2: real per-capita disposable income
+    # YDᴴ[h] = [(1-scᴴ[h])*Wᴴ[h] + Πᴴ[h] + STᴴ[h]] / (Popᴴ[h] * pᶜᴴ[h])
+    vec(Symbolics.scalarize(YDᴴ ~ ((1 .- scᴴ) .* Wᴴ .+ Πᴴ .+ STᴴ) ./ (Popᴴ .* pᶜᴴ))),
+
+    # Step 3: consumption adjustment toward LES target
+    # ηᴴ = own-price elasticities from Breisinger/IFPRI (sector × quintile)
+    vec(Symbolics.scalarize(D.(Cᴴ) ~ βᶜ .* (Popᴴ' .* (c⁰ .+ c¹ .* (YDᴴ' .- sum(c⁰, dims=1)) .*
+    max.(pᶠ .* ones(N,H) ./ pᶜᴴ', 1e-8).^ηᴴ) .- Cᴴ))),
+
+    # =========================================================================
+    # WAGE DYNAMICS
+    # =========================================================================
+    # Desired wage grows with labour market tightness and inflation
+    Symbolics.scalarize(D.(wᵈ) ~ exp(γⁿ * (nₜ / nᵃ - λⁿ)) * πʸ * wᵈ),
+    Symbolics.scalarize(D.(w)  ~ βʷ * (wᵈ - w)),
+    Symbolics.scalarize(n ~ y ./ a),
+
+    # =========================================================================
+    # GOVERNMENT
+    # =========================================================================
+    Symbolics.scalarize(Tʸ ~ (yᴰ .* pᵇ + m .* (1 .+ tᴹ) .* pᵂ * eᴺ)' * tʸ),
+    Symbolics.scalarize(Tᴹ ~ (m .* pᵂ * eᴺ)' * tᴹ),
+    SC ~ scᴴ' * Wᴴ,
+    SG ~ Tʸ + Tᴹ + SC - g' * pᶠ - ST,
+
+    # =========================================================================
+    # PRICE DYNAMICS
+    # =========================================================================
+    Symbolics.scalarize(pᵈ ~ (1 .+ μ) .* (w ./ a + A' * pᶠ)),
+    Symbolics.scalarize(D.(pᵇ) ~ βᵖ .* (pᵈ - pᵇ)),
+    Symbolics.scalarize(μ ~ μ₀ + μ₁ * (vᵈ ./ max.(v, 1e-6) .- 1)),
+    Symbolics.scalarize(pᶠ ~ (σᴹ .* (pᵂ .* (1 .+ tᴹ) * eᴺ) + (1 .- σᴹ) .* pᵇ) .* (1 .+ tʸ)),
+    pᶜ ~ (cᵇ' * pᶠ) ./ sum(cᵇ),
+
+    # =========================================================================
+    # AGGREGATES
+    # =========================================================================
+    πₜ ~ D.(pᶜ) / pᶜ,
+    yₜ ~ sum(y),
+    gₜ ~ D.(yₜ) / yₜ,
+    D.(gʸ) ~ gₜ - gʸ,
+    D.(πʸ) ~ πₜ - πʸ,
+    nₜ ~ sum(n),
+    NX   ~ x' * (pᵇ .* (1 .+ tʸ)) - m' * (pᵂ * eᴺ),
+    GDP  ~ (cₐ + g + iᴷ + x)' * pᵇ - m' * (pᵂ * eᴺ),
+    # GDP is basic-price (pᵇ). It is used only as the denominator in the transfer
+    # rule (ST) and as a plot scale — it is NOT an input to the Leontief block.
+    # A market-price definition (final demand at pᶠ) would shift the absolute
+    # transfer magnitude slightly; this is a second-order effect on a denominator.
+    # S = I check: SP + SG - NX - Invₜ should = 0 at all times
+
+    SP ~ sum(Popᴴ .* pᶜᴴ .* YDᴴ) - pᶠ' * cₐ,       
+    Invₜ ~ iᴷ' * pᶠ,
+
+    # =========================================================================
+    # SOCIAL TRANSFER,  Two modes selected by δˢ:
+    # =========================================================================
+    #   δˢ=0 (fixed):   ST = στˢ × GDP   → στˢ is transfer as a fraction of GDP
+    #   δˢ=1 (dynamic): ST = στˢ × extra net product-tax revenue from the reform
+    #   Transfer directed to bottom 40% via στᴴ = [0.5, 0.5, 0, 0, 0].
+   
+    ST ~ στˢ * ((1 - δˢ) * GDP + δˢ * sum((tʸ .- tʸʳᵉᶠ) .* (yᴰ .* pᵇ .+ m .* (1 .+ tᴹ) .* pᵂ * eᴺ))),
+    vec(Symbolics.scalarize(STᴴ ~ ST .* στᴴ)),
+)
+
+@named ESTEEM_DAE = ODESystem(eqs, t)
+@time ESTEEM_ODE = structural_simplify(ESTEEM_DAE)
+
+# =============================================================================
+# 6) NUMERICAL PARAMETER INSTANTIATION
+# =============================================================================
+
+# βʸ: output expectation adjustment speed (sector-specific) - Arbitrary
+βʸ_vec = fill(3.0, N)
+βʸ_vec[[1,2]]       .= 1.0   # Agriculture (slow, seasonal-constrained)
+βʸ_vec[[3,4]]       .= 1.0   # Mining & oil/gas extraction (slow, capital-constrained)
+βʸ_vec[[14,29,30]]  .= 1.0   # Petroleum refining, electricity, water (infrastructure)
+
+# βᵖ: price adjustment speed (sector-specific)
+# Source: IMF Philippines annex (Laurent), converted to continuous time (× 6)
+βᵖ_vec = fill(2.0, N)              # default: Other Services
+βᵖ_vec[[1,2]]         .= 6.0       # Agriculture
+βᵖ_vec[5:28]          .= 3.0       # Manufacturing
+βᵖ_vec[[3,14,29,30]]  .= 1.5       # Energy & Water (includes manufacture of petro-products)
+βᵖ_vec[[4]]           .= 6.0       # Mining & Quarrying
+βᵖ_vec[[31]]          .= 3.0       # Construction
+βᵖ_vec[[33,34]]       .= 6.0       # Transport
+βᵖ_vec[[35,53]]       .= 1.0       # Accommodation & Restaurants
+βᵖ_vec[[36,38,39]]    .= 0.2       # IT & Communications
+βᵖ_vec[[43,51]]       .= 2.0       # Real Estate
+βᵖ_vec[[50,59]]       .= 1.5       # Human Health
+βᵖ_vec[[58]]          .= 0.2       # Education
+
+p = Dict(vcat(
+    vec(collect(A    .=> AA)),
+    vec(collect(vᵈ   .=> 0.1 * yy)),
+    vec(collect(g    .=> gg)),
+    vec(collect(iᴷ   .=> iK)),
+    vec(collect(pᵂ   .=> ones(N) / 18.0)),                               # world price in EGP (≈ 18 EGP/USD)
+   # vec(collect(ζˣ .=> ζˣ_vec)),
+   # vec(collect(ζᴹ .=> ζᴹ_vec)),
+    vec(collect(cᵇ   .=> cc)),                                           # aggregate CPI basket
+    vec(collect(tʸ   .=> tY)),
+    vec(collect(tᴹ   .=> tM)),
+    vec(collect(μ₀   .=> mu0)),
+    vec(collect(a    .=> yy ./ nn)),                                     # labour productivity
+    # LES parameters
+    vec(collect(c⁰   .=> c0Q)),                                          # subsistence per capita (67×5)
+    vec(collect(c¹   .=> c1Q)),                                          # marginal budget shares (67×5)
+    vec(collect(cᵇʰ  .=> CQ)),                                           # quintile CPI baskets (67×5)
+    # Household distribution parameters
+    vec(collect(Popᴴ .=> POPQ)),                                         # population (length-5)
+    vec(collect(Θʷ   .=> THETAW)),                                       # wage shares (67×5)
+    vec(collect(Θᵖ   .=> THETAPI)),                                      # profit shares (67×5)
+    vec(collect(scᴴ  .=> SCQ)),                                          # scc rates (length-5)
+    vec(collect(βʸ   .=> βʸ_vec)),                                       # expectation adjustment 
+    vec(collect(βᵖ   .=> βᵖ_vec)),                                       # price adjustment speeds 
+    vec(collect(ηᴴ   .=> ETA_own)),                                      # sector × quintile own-price (but actually relative) elasticities
+    vec(collect(στᴴ  .=> [0.5, 0.5, 0.0, 0.0, 0.0])),                    # transfer to bottom 40% equally split
+    #vec(collect(ηˣ .=> ηˣ_vec)),                                        # export price elasticity
+    #vec(collect(ηᴹ .=> ηᴹ_vec)),                                        # import price elasticity
+    βᶜ  => 1.0,                                                          # consumption adjustment speed
+    βʷ  => 1.0,                                                          # wage adjustment speed
+    μ₁  => 0.1,                                                          # inventory markup sensitivity (sensitivity analysis below)
+    γⁿ  => 1.0,                                                          # wage Phillips curve sensitivity
+    λⁿ  => 1.0,                                                        
+    nᵃ  => sum(nn),
+    στˢ => 0.0,                                                          # baseline: no transfer
+    eᴺ => 18.0,
+    δˢ      => 0.0,                                                      # baseline: fixed % GDP mode
+
+    vec(collect(ζˣ .=> ζˣ_vec)),
+    vec(collect(ζᴹ .=> ζᴹ_vec)),
+    vec(collect(ηˣ .=> ηˣ_vec)),
+    vec(collect(ηᴹ .=> ηᴹ_vec)),
+    vec(collect(tʸʳᵉᶠ .=> tY)),                                          # reference = pre-shock tax rates
+
+))
+
+# =============================================================================
+# 7) INITIAL CONDITIONS
+# =============================================================================
+
+u0 = Dict(vcat(
+    Symbolics.scalarize(v   .=> 0.1 * yy),
+    Symbolics.scalarize(yᵉ  .=> yy),
+    Symbolics.scalarize(w   .=> ww .* (yy ./ nn)),
+    Symbolics.scalarize(wᵈ  .=> ww .* (yy ./ nn)),
+    Symbolics.scalarize(pᵇ  .=> ones(N)),
+    vec(Symbolics.scalarize(Cᴴ  .=> CQ)),
+    gʸ => 0.0,
+    πʸ => 0.0,
+    Symbolics.scalarize(pᶠ  .=> pf),
+    Symbolics.scalarize(σᴹ  .=> sigmaM),
+    Symbolics.scalarize(x   .=> xx),
+    Symbolics.scalarize(m   .=> mm),
+    Symbolics.scalarize(yᴬ  .=> yA),
+    Symbolics.scalarize(yᴰ  .=> yA .+ xx .- mm),
+    Symbolics.scalarize(n   .=> yy ./ nn),
+    Symbolics.scalarize(cₐ  .=> cc),
+    vec(Symbolics.scalarize(Wᴴ  .=> DW)),
+    vec(Symbolics.scalarize(Πᴴ  .=> DPI)),
+    vec(Symbolics.scalarize(YDᴴ .=> YDH_h ./ (POPQ .* pCQ))),
+    vec(Symbolics.scalarize(pᶜᴴ .=> pCQ)),
+    pᶜ => pC_base,
+    W  => sum(WW_sec),
+    Π  => sum(GOS_sec),
+    YD => sum(WW_sec) + sum(GOS_sec),
+    SC => sum(SCQ .* DW),
+    SP => sum(YDH_h) - sum(cc .* pf),
+    yₜ  => sum(yy),
+    nₜ  => sum(yy ./ nn),
+    ST => 0.0,
+    vec(Symbolics.scalarize(STᴴ .=> zeros(H))),
+))
+
+tspan = (0.0, 5.0)
+
+# =============================================================================
+# 8) SOLVE BASELINE
+# =============================================================================
+
+prob = ODEProblem(ESTEEM_ODE, u0, tspan, p)
+@time sol0 = solve(prob, Rosenbrock23(), saveat=1/12, abstol=1e-8, reltol=1e-6)
+
+println("Solver finished. Final t = ", sol0.t[end])
+println("=== End-of-simulation check ===")
+println("Output ratio t=5/t=0: ", round(sol0[yₜ][end] / sol0[yₜ][1], digits=5))
+println("Real income Q1 t=5/t=0: ", round(sol0[YDᴴ[1]][end] / sol0[YDᴴ[1]][1], digits=5))
+println("Real income Q5 t=5/t=0: ", round(sol0[YDᴴ[5]][end] / sol0[YDᴴ[5]][1], digits=5))
+println("Cons Q1 t=5/t=0: ", round(sum(sol0[Cᴴ[j,1]][end] for j in 1:N) / sum(sol0[Cᴴ[j,1]][1] for j in 1:N), digits=5))
+println("Cons Q5 t=5/t=0: ", round(sum(sol0[Cᴴ[j,5]][end] for j in 1:N) / sum(sol0[Cᴴ[j,5]][1] for j in 1:N), digits=5))
+
+println("Export drift t=5/t=0: ",
+        round(sum(sol0[x[i]][end] for i in 1:N) /
+              sum(sol0[x[i]][1]   for i in 1:N), digits=6))   # should be ≈ 1.0
+
+# S=I check (should be ≈ 0)
+si_residual = sol0[SP] .+ sol0[SG] .- sol0[NX] .- sol0[Invₜ]
+println("\n=== S=I check ===")
+println("Max |residual|: ", round(maximum(abs.(si_residual)), digits=2))
+println("S=I / GDP: ", round(maximum(abs.(si_residual)) / sol0[GDP][1], sigdigits=3))
+
+# =============================================================================
+# 8b) BASELINE STABILITY PLOTS
+# =============================================================================
+
+colors_q = [:royalblue, :seagreen, :darkorange, :mediumpurple, :crimson]
+
+# 1. S=I residual
+ps1 = plot(sol0.t, sol0[SP] .+ sol0[SG] .- sol0[NX] .- sol0[Invₜ],
+           title="S=I residual (must = 0)", label="residual", lw=2, color=:red)
+hline!(ps1, [0.0], ls=:dot, color=:black, label="")
+
+# 2. Aggregate output
+ps2 = plot(sol0.t, sol0[yₜ] ./ sol0[yₜ][1],
+           title="Output Y/Y₀ (must = 1)", label="Y",
+           lw=2, color=:blue, ylims=(0.95, 1.05))
+hline!(ps2, [1.0], ls=:dot, color=:black, label="")
+
+# 3. Aggregate CPI
+ps3 = plot(sol0.t, sol0[pᶜ],
+           title="Aggregate CPI (must ≈ 1, flat)", label="pC", lw=2, color=:blue)
+hline!(ps3, [1.0], ls=:dot, color=:black, label="")
+
+# 4. Quintile CPIs
+ps4 = plot(title="Quintile CPIs (must ≈ 1, flat)", lw=2)
+for h in 1:H
+    plot!(ps4, sol0.t, sol0[pᶜᴴ[h]], label="Q$h", color=colors_q[h])
+end
+hline!(ps4, [1.0], ls=:dot, color=:black, label="")
+
+# 5. Real disposable income by quintile
+ps5 = plot(title="Real income/quintile (must = 1)", lw=2, ylims=(0.95, 1.05))
+for h in 1:H
+    plot!(ps5, sol0.t, sol0[YDᴴ[h]] ./ sol0[YDᴴ[h]][1], label="Q$h", color=colors_q[h])
+end
+hline!(ps5, [1.0], ls=:dot, color=:black, label="")
+
+# 6. Per-capita consumption by quintile
+ps6 = plot(title="Consumption/quintile (must = 1)", lw=2, ylims=(0.95, 1.05))
+for h in 1:H
+    c_base = [sum(sol0[Cᴴ[j,h]][ti] for j in 1:N) for ti in eachindex(sol0.t)]
+    plot!(ps6, sol0.t, c_base ./ c_base[1], label="Q$h", color=colors_q[h])
+end
+hline!(ps6, [1.0], ls=:dot, color=:black, label="")
+
+# 7. Exchange rate
+ps7 = plot(sol0.t, fill(18.0, length(sol0.t)),
+           title="Exchange rate (must = 18, flat)", label="eᴺ", lw=2, color=:blue)
+hline!(ps7, [18.0], ls=:dot, color=:black, label="")
+
+# 8. NX/GDP ratio
+nx_gdp_ref = sum(xx .* (1 .+ tY) .- mm) / sum(cc .+ gg .+ iK .+ xx .- mm)
+ps8 = plot(sol0.t, sol0[NX] ./ sol0[GDP],
+           title="NX/GDP (must be flat)", label="NX/GDP", lw=2, color=:blue,
+           ylims=(nx_gdp_ref - 0.01, nx_gdp_ref + 0.01))
+hline!(ps8, [nx_gdp_ref], ls=:dot, color=:black, label="ref")
+
+plot(ps1, ps2, ps3, ps4, ps5, ps6, ps7, ps8,
+     layout=(4,2), size=(1200, 1400), legendfontsize=8,
+     plot_title="Baseline Calibration Diagnostics — ESTEEM-Egypt")
+savefig("plot_appendix_baseline_stability.png")
+println("Stability plots saved.")
+
+println("YDᴴ Q1 baseline range: ", extrema(sol0[YDᴴ[1]] ./ sol0[YDᴴ[1]][1]))
+println("Cᴴ Q1 baseline range: ", extrema([sum(sol0[Cᴴ[j,1]][ti] for j in 1:N) for ti in eachindex(sol0.t)] ./ sum(sol0[Cᴴ[j,1]][1] for j in 1:N)))
+println("\n=== Baseline flatness check (all quintiles) ===")
+for h in 1:H
+    println("  YDᴴ Q$h range: ",
+            extrema(sol0[YDᴴ[h]] ./ sol0[YDᴴ[h]][1]))
+end
+println("Aggregate output range: ",
+        extrema(sol0[yₜ] ./ sol0[yₜ][1]))
+println("Aggregate CPI range: ",
+        extrema(sol0[pᶜ] ./ sol0[pᶜ][1]))
+println("Export drift range: ",
+        extrema([sum(sol0[x[i]][ti] for i in 1:N) for ti in eachindex(sol0.t)] ./
+                sum(sol0[x[i]][1] for i in 1:N)))
+
+# =============================================================================
+# 9) FUEL PRICE SHOCK SCENARIO
+# =============================================================================
+# Shock: remove petroleum subsidy keeping only LPG (19.1% of total fuel subsidies according to Breisinger and MoF 2014)
+# Transfer activated in S1–S3, directed to bottom 40% (στᴴ = [0.5, 0.5, 0, 0, 0])
+tY_new = copy(tY)
+tY_new[14] = tY[14] * 0.190734179
+
+println("Original tY[14]: ", tY[14])
+println("Shocked  tY[14]: ", tY_new[14])
+println("Tax rate change sector 14: ", round(tY_new[14] - tY[14], digits=4))
+
+# S0: Pure shock, no transfer
+p_s0 = copy(p)
+p_s0[στˢ] = 0.0
+p_s0[δˢ]  = 0.0
+for j in 1:N
+    p_s0[tʸ[j]]    = tY_new[j]
+    p_s0[tʸʳᵉᶠ[j]] = tY[j]
+end
+sol_s0 = solve(ODEProblem(ESTEEM_ODE, u0, tspan, p_s0),
+               Rosenbrock23(), saveat=1/12, abstol=1e-8, reltol=1e-6)
+println("S0 (pure shock, no transfer) solved. t=", sol_s0.t[end])
+
+# S1: Full fiscal savings → bottom 40%
+p_s1 = copy(p)
+p_s1[στˢ] = 1.0
+p_s1[δˢ]  = 1.0
+for j in 1:N
+    p_s1[tʸ[j]]    = tY_new[j]
+    p_s1[tʸʳᵉᶠ[j]] = tY[j]
+end
+sol_s1 = solve(ODEProblem(ESTEEM_ODE, u0, tspan, p_s1),
+               Rosenbrock23(), saveat=1/12, abstol=1e-8, reltol=1e-6)
+println("S1 (full fiscal savings → bottom 40%) solved. t=", sol_s1.t[end])
+
+# S2: 0.4% of GDP → bottom 40% (IMF TKP commitment FY2025/26,
+#     4th Review July 2025, proposed structural benchmark)
+p_s2 = copy(p)
+p_s2[στˢ] = 0.004    # 0.4% of GDP
+p_s2[δˢ]  = 0.0
+for j in 1:N
+    p_s2[tʸ[j]]    = tY_new[j]
+    p_s2[tʸʳᵉᶠ[j]] = tY[j]
+end
+sol_s2 = solve(ODEProblem(ESTEEM_ODE, u0, tspan, p_s2),
+               Rosenbrock23(), saveat=1/12, abstol=1e-8, reltol=1e-6)
+println("S2 (0.4% GDP → bottom 40%) solved. t=", sol_s2.t[end])
+
+# S3: 0.25% of GDP → bottom 40% (actual TKP average, CAPMAS 2016–2024)
+p_s3 = copy(p)
+p_s3[στˢ] = 0.0025   # 0.25% of GDP
+p_s3[δˢ]  = 0.0
+for j in 1:N
+    p_s3[tʸ[j]]    = tY_new[j]
+    p_s3[tʸʳᵉᶠ[j]] = tY[j]
+end
+sol_s3 = solve(ODEProblem(ESTEEM_ODE, u0, tspan, p_s3),
+               Rosenbrock23(), saveat=1/12, abstol=1e-8, reltol=1e-6)
+println("S3 (0.25% GDP → bottom 40%, actual TKP) solved. t=", sol_s3.t[end])
+
+# Transfer diagnostics
+println("\n=== Transfer diagnostics at t=0 ===")
+println("Baseline GDP: ", round(sol0[GDP][1]/1e6, digits=1), " bn EGP")
+for (lab, sol) in zip(["S0","S1","S2","S3"],
+                       [sol_s0, sol_s1, sol_s2, sol_s3])
+    st0 = sol[ST][1]
+    pct = st0 / sol0[GDP][1] * 100
+    println("$lab: ST = $(round(st0/1e6, digits=2)) bn EGP",
+            " ($(round(pct, digits=3))% of GDP)")
+end
+
+println("\n=== Petroleum & Energy exports — % change vs baseline ===")
+for (yr, ti) in zip(0:5, [1, 13, 25, 37, 49, 61])
+    d = (sum(sol_s0[x[i]][ti] for i in [14,29,30]) /
+         sum(sol0[x[i]][ti]   for i in [14,29,30]) - 1) * 100
+    println("  t=$yr: ", round(d, digits=1), "%")
+end
+
+# ===========================================================================
+# COMPREHENSIVE NUMERICAL OUTPUT FOR THESIS VERIFICATION
+# Prints every quintile-level number used in the thesis text.
+# ===========================================================================
+
+println("\n" * "="^70)
+println("CONSUMPTION RESPONSE BY QUINTILE — ALL SCENARIOS AT t=5")
+println("="^70)
+for (lab, sol) in zip(["S0", "S1", "S2", "S3"], [sol_s0, sol_s1, sol_s2, sol_s3])
+    println("\n$lab:")
+    for h in 1:H
+        base_c  = sum(sol0[Cᴴ[j,h]][1]   for j in 1:N)
+        shock_c = sum(sol[Cᴴ[j,h]][end]  for j in 1:N)
+        ratio   = shock_c / base_c
+        pct     = (ratio - 1) * 100
+        println("  Q$h consumption: ratio=$(round(ratio, digits=5))  Δ=$(round(pct, digits=3))%")
+    end
+end
+
+println("\n" * "="^70)
+println("CONSUMPTION RESPONSE BY QUINTILE — ALL SCENARIOS — TIME PATH")
+println("Sample points: t=0, t=1, t=2, t=3, t=4, t=5 (for plot_L verification)")
+println("="^70)
+sample_t_idx = [1, 13, 25, 37, 49, 61]  # 0, 12, 24, 36, 48, 60 months (saveat=1/12)
+sample_t = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
+for (lab, sol) in zip(["S0", "S1", "S2", "S3"], [sol_s0, sol_s1, sol_s2, sol_s3])
+    println("\n$lab:")
+    for h in 1:H
+        base_c_path  = [sum(sol0[Cᴴ[j,h]][ti] for j in 1:N) for ti in sample_t_idx]
+        shock_c_path = [sum(sol[Cᴴ[j,h]][ti]  for j in 1:N) for ti in sample_t_idx]
+        ratios = shock_c_path ./ base_c_path
+        println("  Q$h consumption ratios at t=0,1,2,3,4,5: ", round.(ratios, digits=4))
+    end
+end
+
+println("\n" * "="^70)
+println("REAL INCOME BY QUINTILE — ALL SCENARIOS — TIME PATH")
+println("Sample points: t=0, t=1, t=2, t=3, t=4, t=5")
+println("="^70)
+for (lab, sol) in zip(["S0", "S1", "S2", "S3"], [sol_s0, sol_s1, sol_s2, sol_s3])
+    println("\n$lab:")
+    for h in 1:H
+        ratios = [sol[YDᴴ[h]][ti] / sol0[YDᴴ[h]][ti] for ti in sample_t_idx]
+        println("  Q$h real income ratios at t=0,1,2,3,4,5: ", round.(ratios, digits=4))
+    end
+end
+
+println("\n" * "="^70)
+println("CPI BY QUINTILE — ALL SCENARIOS AT t=5")
+println("="^70)
+for (lab, sol) in zip(["S0", "S1", "S2", "S3"], [sol_s0, sol_s1, sol_s2, sol_s3])
+    println("\n$lab:")
+    for h in 1:H
+        ratio = sol[pᶜᴴ[h]][end] / sol0[pᶜᴴ[h]][end]
+        pct = (ratio - 1) * 100
+        println("  Q$h CPI: ratio=$(round(ratio, digits=5))  Δ=$(round(pct, digits=3))%")
+    end
+end
+
+println("\n" * "="^70)
+println("AGGREGATE OUTPUT — ALL SCENARIOS AT t=5")
+println("="^70)
+for (lab, sol) in zip(["S0", "S1", "S2", "S3"], [sol_s0, sol_s1, sol_s2, sol_s3])
+    ratio = sol[yₜ][end] / sol0[yₜ][end]
+    pct = (ratio - 1) * 100
+    println("$lab: output ratio=$(round(ratio, digits=5))  Δ=$(round(pct, digits=3))%")
+end
+
+println("\n" * "="^70)
+println("AGGREGATE CPI — ALL SCENARIOS AT t=5")
+println("="^70)
+for (lab, sol) in zip(["S0", "S1", "S2", "S3"], [sol_s0, sol_s1, sol_s2, sol_s3])
+    ratio = sol[pᶜ][end] / sol0[pᶜ][end]
+    pct = (ratio - 1) * 100
+    println("$lab: aggregate CPI ratio=$(round(ratio, digits=5))  Δ=$(round(pct, digits=3))%")
+end
+
+println("\n" * "="^70)
+println("BOTTOM 40% (Q1+Q2 population-weighted) — TIME PATH")
+println("="^70)
+for (lab, sol) in zip(["S0", "S1", "S2", "S3"], [sol_s0, sol_s1, sol_s2, sol_s3])
+    println("\n$lab:")
+    # Real income B40
+    b40_inc = [(sol[YDᴴ[1]][ti] * POPQ[1] + sol[YDᴴ[2]][ti] * POPQ[2]) /
+               (sol0[YDᴴ[1]][ti] * POPQ[1] + sol0[YDᴴ[2]][ti] * POPQ[2])
+               for ti in sample_t_idx]
+    println("  B40 real income ratios at t=0,1,2,3,4,5: ", round.(b40_inc, digits=4))
+    # Consumption B40
+    base_c_b40  = [(sum(sol0[Cᴴ[j,1]][ti] for j in 1:N) * POPQ[1] +
+                    sum(sol0[Cᴴ[j,2]][ti] for j in 1:N) * POPQ[2])
+                   for ti in sample_t_idx]
+    shock_c_b40 = [(sum(sol[Cᴴ[j,1]][ti] for j in 1:N) * POPQ[1] +
+                    sum(sol[Cᴴ[j,2]][ti] for j in 1:N) * POPQ[2])
+                   for ti in sample_t_idx]
+    b40_cons = shock_c_b40 ./ base_c_b40
+    println("  B40 consumption ratios at t=0,1,2,3,4,5: ", round.(b40_cons, digits=4))
+end
+
+println("\n" * "="^70)
+println("END OF VERIFICATION OUTPUT")
+println("="^70)
+
+# =============================================================================
+# 10) SHOCK PLOTS — four scenarios
+# =============================================================================
+
+colors_q = [:royalblue, :seagreen, :darkorange, :mediumpurple, :crimson]
+sc_cols  = [:black, :royalblue, :seagreen, :crimson]
+sc_labs  = [
+    "S0: No transfer (shock only)",
+    "S1: Full fiscal savings → bottom 40%",
+    "S2: 0.4% GDP → bottom 40% (IMF commitment)",
+    "S3: 0.25% GDP → bottom 40% (actual TKP)"
+]
+sc_sols = [sol_s0, sol_s1, sol_s2, sol_s3]
+sc_ls   = [:dot, :solid, :dash, :dashdot]
+
+# 1. Real disposable income Q1 — all four scenarios
+p1 = plot(title="Real Income Q1 — Four Scenarios", lw=2)
+for (sol, col, lab, ls) in zip(sc_sols, sc_cols, sc_labs, sc_ls)
+    plot!(p1, sol.t, sol[YDᴴ[1]] ./ sol0[YDᴴ[1]], label=lab, color=col, lw=2, ls=ls)
+end
+hline!(p1, [1.0], ls=:dot, color=:grey, label="baseline")
+
+# 2. Real disposable income Q5 — all four scenarios
+p2 = plot(title="Real Income Q5 — Four Scenarios", lw=2)
+for (sol, col, lab, ls) in zip(sc_sols, sc_cols, sc_labs, sc_ls)
+    plot!(p2, sol.t, sol[YDᴴ[5]] ./ sol0[YDᴴ[5]], label=lab, color=col, lw=2, ls=ls)
+end
+hline!(p2, [1.0], ls=:dot, color=:grey, label="baseline")
+
+# 3. Real income all quintiles — S2 (0.4% GDP transfer, IMF commitment)
+p3 = plot(title="Real Income by Quintile — S2: 0.4% GDP Transfer", lw=2)
+for h in 1:H
+    plot!(p3, sol_s2.t, sol_s2[YDᴴ[h]] ./ sol0[YDᴴ[h]], label="Q$h", color=colors_q[h], lw=2)
+end
+hline!(p3, [1.0], ls=:dot, color=:black, label="baseline")
+
+# 4. Total consumption by quintile — S2
+p4 = plot(title="Total Consumption by Quintile — S2: 0.4% GDP Transfer", lw=2)
+for h in 1:H
+    base_c  = [sum(sol0[Cᴴ[j,h]][ti]    for j in 1:N) for ti in eachindex(sol0.t)]
+    shock_c = [sum(sol_s2[Cᴴ[j,h]][ti]  for j in 1:N) for ti in eachindex(sol_s2.t)]
+    plot!(p4, sol_s2.t, shock_c ./ base_c, label="Q$h", color=colors_q[h], lw=2)
+end
+hline!(p4, [1.0], ls=:dot, color=:black, label="baseline")
+
+# 5. CPI by quintile — S2
+p5 = plot(title="CPI by Quintile — S2: 0.4% GDP Transfer", lw=2)
+for h in 1:H
+    plot!(p5, sol_s2.t, sol_s2[pᶜᴴ[h]] ./ sol0[pᶜᴴ[h]], label="Q$h", color=colors_q[h], lw=2)
+end
+hline!(p5, [1.0], ls=:dot, color=:black, label="baseline")
+
+# 6. Aggregate output — all four scenarios
+p6 = plot(title="Aggregate Output — Four Scenarios", lw=2)
+for (sol, col, lab, ls) in zip(sc_sols, sc_cols, sc_labs, sc_ls)
+    plot!(p6, sol.t, sol[yₜ] ./ sol0[yₜ], label=lab, color=col, lw=2, ls=ls)
+end
+hline!(p6, [1.0], ls=:dot, color=:grey, label="baseline")
+
+# 7. Social transfer ST — all four scenarios
+p7 = plot(title="Social Transfer ST — Four Scenarios", lw=2)
+for (sol, col, lab, ls) in zip(sc_sols, sc_cols, sc_labs, sc_ls)
+    plot!(p7, sol.t, sol[ST], label=lab, color=col, lw=2, ls=ls)
+end
+
+# 8. Government surplus — all four scenarios
+p8 = plot(title="Govt Surplus SG — Four Scenarios", lw=2)
+for (sol, col, lab, ls) in zip(sc_sols, sc_cols, sc_labs, sc_ls)
+    plot!(p8, sol.t, sol[SG] ./ sol0[SG], label=lab, color=col, lw=2, ls=ls)
+end
+hline!(p8, [1.0], ls=:dot, color=:grey, label="baseline")
+
+println("Scenario plots saved.")
+
+# =================================================================================================================
+# 11) SENSITIVITY ANALYSIS — Based on S2 (0.4% GDP transfer, IMF 4th review commitment July 2025) as main scenario
+# =================================================================================================================
+
+ratio(sol, h) = sol[YDᴴ[h]][end] / sol0[YDᴴ[h]][end]
+
+# --- βᵖ scenarios ---
+bp_scenarios = Dict(
+    "fast"     => fill(6.0, N),
+    "baseline" => βᵖ_vec,
+    "slow"     => fill(0.5, N),
+)
+
+# --- βʸ scenarios ---
+by_fast = copy(βʸ_vec)
+by_fast[by_fast .== 3.0] .= 5.0
+
+by_slow = copy(βʸ_vec)
+by_slow[by_slow .== 3.0] .= 1.5
+by_slow[by_slow .== 1.0] .= 0.5
+
+by_scenarios = Dict(
+    "fast"     => by_fast,
+    "baseline" => βʸ_vec,
+    "slow"     => by_slow,
+)
+
+# --- μ₁ scenarios ---
+mu_scenarios = Dict(
+    "pure cost-push (0.0)" => 0.0,
+    "baseline (0.1)"       => 0.1,
+    "high markup (0.5)"    => 0.5,
+)
+
+# --- η trade elasticity scenarios ---
+# Load Breisinger values from original Trade Elasticities sheet
+ηˣ_br = vec(Float64.(EGYHH["Trade Elasticities BR"]["E6:E72"]))
+
+η_scenarios = Dict(
+    "uniform -0.7"                 => fill(-0.7, N),
+    "Eldeep-Zaki 2023 (baseline)"  => ηᴹ_vec, # placeholder only — loop uses ηˣ_vec/ηᴹ_vec directly
+    "Griffin 2016 (uniform -2.5)"  => fill(-2.5, N),
+    "Cockburn 2018 (uniform -2.0)" => fill(-2.0, N),
+    "Breisinger 2018 (GTAP)"       => ηˣ_br,
+)
+
+# --- Run βᵖ sensitivity ---
+println("Running βᵖ sensitivity...")
+results_bp = Dict()
+for (name, bp) in bp_scenarios
+    p_sens = copy(p_s2)
+    for j in 1:N; p_sens[βᵖ[j]] = bp[j]; end
+    results_bp[name] = solve(ODEProblem(ESTEEM_ODE, u0, tspan, p_sens),
+                             Rosenbrock23(), saveat=1/12, abstol=1e-8, reltol=1e-6)
+    println("  βᵖ $name → Q1: $(round(ratio(results_bp[name],1), digits=4))",
+            "  Q5: $(round(ratio(results_bp[name],5), digits=4))")
+end
+
+# --- Run βʸ sensitivity ---
+println("Running βʸ sensitivity...")
+results_by = Dict()
+for (name, by) in by_scenarios
+    p_sens = copy(p_s2)
+    for j in 1:N; p_sens[βʸ[j]] = by[j]; end
+    results_by[name] = solve(ODEProblem(ESTEEM_ODE, u0, tspan, p_sens),
+                             Rosenbrock23(), saveat=1/12, abstol=1e-8, reltol=1e-6)
+    println("  βʸ $name → Q1: $(round(ratio(results_by[name],1), digits=4))",
+            "  Q5: $(round(ratio(results_by[name],5), digits=4))")
+end
+
+# --- Run μ₁ sensitivity ---
+println("Running μ₁ sensitivity...")
+results_mu = Dict()
+for (name, mu) in mu_scenarios
+    p_sens = copy(p_s2)
+    p_sens[μ₁] = mu
+    results_mu[name] = solve(ODEProblem(ESTEEM_ODE, u0, tspan, p_sens),
+                             Rosenbrock23(), saveat=1/12, abstol=1e-8, reltol=1e-6)
+    println("  μ₁ $name → Q1: $(round(ratio(results_mu[name],1), digits=4))",
+            "  Q5: $(round(ratio(results_mu[name],5), digits=4))")
+end
+
+# --- Run η sensitivity ---
+println("Running η trade elasticity sensitivity...")
+results_η = Dict()
+for (name, η_vec) in η_scenarios
+    p_sens = copy(p_s2)
+    η_vec_x = (name == "Eldeep-Zaki 2023 (baseline)") ? ηˣ_vec : η_vec
+    η_vec_m = (name == "Eldeep-Zaki 2023 (baseline)") ? ηᴹ_vec : η_vec
+    ζˣ_s = xx ./ max.(1 .+ tY, 1e-4).^η_vec_x
+    ζᴹ_s = sigmaM .* max.(1 .+ tM,  1e-4).^(-η_vec_m)
+    for j in 1:N
+        p_sens[ηˣ[j]] = η_vec_x[j]
+        p_sens[ηᴹ[j]] = η_vec_m[j]
+        p_sens[ζˣ[j]] = ζˣ_s[j]
+        p_sens[ζᴹ[j]] = ζᴹ_s[j]
+    end
+    results_η[name] = solve(ODEProblem(ESTEEM_ODE, u0, tspan, p_sens),
+                            Rosenbrock23(), saveat=1/12, abstol=1e-8, reltol=1e-6)
+    println("  η $name → Q1: $(round(ratio(results_η[name],1), digits=4))",
+            "  Q5: $(round(ratio(results_η[name],5), digits=4))")
+end
+
+# --- Summary Table ---
+println("\n=== Shock Impact at t=5 (ratio shock/baseline) ===")
+for (name, sol) in zip(sc_labs, sc_sols)
+    println("\n$name:")
+    for h in 1:H
+        println("  Q$h real income: ",
+                round(sol[YDᴴ[h]][end] / sol0[YDᴴ[h]][end], digits=4))
+    end
+end
+
+# Compensation adequacy table
+println("\n=== Compensation Adequacy: % of Q1 welfare loss recovered at t=5 ===")
+# Q1 adequacy
+println("Q1 only:")
+loss_s0_q1 = 1.0 - sol_s0[YDᴴ[1]][end] / sol0[YDᴴ[1]][end]
+for (name, sol) in zip(sc_labs, sc_sols)
+    q1end      = sol[YDᴴ[1]][end] / sol0[YDᴴ[1]][end]
+    loss_i     = 1.0 - q1end
+    gap_closed = loss_s0_q1 > 0 ? (loss_s0_q1 - loss_i) / loss_s0_q1 * 100 : 0.0
+    @printf("%-42s │ Q1=%.4f │ gap closed=%.1f%%\n",
+            name[1:min(41,length(name))], q1end, gap_closed)
+end
+
+# Bottom 40% adequacy
+println("\nBottom 40% (Q1+Q2):")
+b40_base_end = (sol0[YDᴴ[1]][end] * POPQ[1] + sol0[YDᴴ[2]][end] * POPQ[2]) / (POPQ[1] + POPQ[2])
+b40_s0_end   = (sol_s0[YDᴴ[1]][end] * POPQ[1] + sol_s0[YDᴴ[2]][end] * POPQ[2]) / (POPQ[1] + POPQ[2])
+loss_s0_b40  = 1.0 - b40_s0_end / b40_base_end
+for (name, sol) in zip(sc_labs, sc_sols)
+    b40_end    = (sol[YDᴴ[1]][end] * POPQ[1] + sol[YDᴴ[2]][end] * POPQ[2]) / (POPQ[1] + POPQ[2])
+    b40_ratio  = b40_end / b40_base_end
+    loss_i     = 1.0 - b40_ratio
+    gap_closed = loss_s0_b40 > 0 ? (loss_s0_b40 - loss_i) / loss_s0_b40 * 100 : 0.0
+    @printf("%-42s │ B40=%.4f │ gap closed=%.1f%%\n",
+            name[1:min(41,length(name))], b40_ratio, gap_closed)
+end
+
+# =============================================================================
+# NOTE: Sectors 3, 11, 13, 27, 28, 34, 37, 47, 52, 65 have under-populated
+# intermediate-input columns in the CAPMAS IO table (input shares <10%),
+# producing implausibly high calibrated markups. They are retained in the
+# model and shown in all figures; in the thesis text these are flagged as
+# data artefacts when they appear in results. See methodology section.
+# =============================================================================
+
+# =============================================================================
+# SECTOR NAMES AND GROUP MAPPING
+# =============================================================================
+
+sector_names = [
+    "Crop & animal production", "Fishing & aquaculture",
+    "Petroleum & gas extraction", "Mining & quarrying",
+    "Food products", "Beverages", "Tobacco", "Textiles",
+    "Wearing apparel", "Leather products", "Wood products",
+    "Paper products", "Printing & media", "Petroleum refining",
+    "Chemicals", "Pharmaceuticals", "Rubber & plastics",
+    "Non-metallic minerals", "Basic metals", "Fabricated metals",
+    "Computer & electronics", "Electrical equipment",
+    "Machinery & equipment", "Motor vehicles",
+    "Other transport equipment", "Furniture", "Other manufacturing",
+    "Machinery repair", "Electricity & gas supply", "Water & waste",
+    "Construction", "Wholesale & retail trade", "Transport & postal",
+    "Warehousing & support transport", "Food & beverage services",
+    "Publishing", "Film, video & music", "Broadcasting",
+    "Telecommunications & IT", "Financial services",
+    "Insurance & pensions", "Auxiliary financial services",
+    "Real estate", "Legal & accounting", "Management consultancy",
+    "Architecture & engineering", "Scientific R&D", "Advertising",
+    "Other professional services", "Veterinary", "Rental & leasing",
+    "Employment activities", "Travel & tourism", "Security services",
+    "Building services", "Office support services",
+    "Public administration", "Education", "Health & social work",
+    "Arts & entertainment", "Libraries & museums",
+    "Gambling & recreation", "Sports & recreation",
+    "Membership organisations", "Computer repair",
+    "Other personal services", "Domestic household services",
+]
+
+sector_groups = Dict(
+    "Agriculture & Fishing"     => collect(1:2),
+    "Extraction & Mining"       => collect(3:4),
+    "Food & Beverage Mfg"       => collect(5:7),
+    "Petroleum & Energy"        => [14, 29, 30],
+    "Other Manufacturing"       => [8:13; 15:28],
+    "Construction"              => [31],
+    "Trade & Transport"         => [32, 33, 34],
+    "ICT & Media"               => [36, 37, 38, 39],
+    "Financial & Business Svcs" => [40,41,42,43,44,45,46,47,48,49,51,52,54,55,56],
+    "Tourism & Hospitality"     => [35, 53],
+    "Public Services"           => [57, 58, 59],
+    "Other Services"            => [50,60,61,62,63,64,65,66,67],
+)
+
+group_order = [
+    "Agriculture & Fishing", "Extraction & Mining",
+    "Food & Beverage Mfg", "Petroleum & Energy",
+    "Other Manufacturing", "Construction",
+    "Trade & Transport", "ICT & Media",
+    "Financial & Business Svcs", "Tourism & Hospitality",
+    "Public Services", "Other Services",
+]
+
+function group_wavg(vals, weights, groups, order)
+    [let idxs = groups[g]
+        sum(weights[idxs] .* vals[idxs]) / sum(weights[idxs])
+     end for g in order]
+end
+
+# =============================================================================
+# IMPROVED MAIN SCENARIO PLOTS
+# =============================================================================
+
+# Plot A — Q1 real income, all four scenarios
+pA = plot(title="Poorest Quintile Real Income — Four Scenarios",
+          xlabel="Years after reform", ylabel="Ratio to baseline",
+          lw=2.5, legend=:topright, size=(800,500), dpi=150,
+          titlefontsize=11, guidefontsize=9, legendfontsize=8)
+for (sol, col, lab, ls) in zip(sc_sols, sc_cols, sc_labs, sc_ls)
+    plot!(pA, sol.t, sol[YDᴴ[1]] ./ sol0[YDᴴ[1]],
+          label=lab, color=col, lw=2.5, ls=ls)
+end
+hline!(pA, [1.0], ls=:dot, color=:grey, lw=1.5, label="Baseline")
+savefig(pA, "plot_A_Q1_four_scenarios.png")
+
+# Plot A2 — Bottom 40% (Q1+Q2), all four scenarios
+pA2 = plot(title="Real Per-Capita Income — Bottom 40% (Q1+Q2)",
+           xlabel="Years after reform", ylabel="Ratio to pre-shock baseline",
+           lw=2.5, legend=:bottomright, size=(900,520), dpi=150,
+           titlefontsize=11, guidefontsize=9, legendfontsize=8)
+for (sol, col, lab, ls) in zip(sc_sols, sc_cols, sc_labs, sc_ls)
+    b40      = (sol[YDᴴ[1]]  .* POPQ[1] .+ sol[YDᴴ[2]]  .* POPQ[2]) ./ (POPQ[1] + POPQ[2])
+    b40_base = (sol0[YDᴴ[1]] .* POPQ[1] .+ sol0[YDᴴ[2]] .* POPQ[2]) ./ (POPQ[1] + POPQ[2])
+    plot!(pA2, sol.t, b40 ./ b40_base, label=lab, color=col, lw=2.5, ls=ls)
+end
+hline!(pA2, [1.0], ls=:dot, color=:grey, lw=1.5, label="Pre-reform baseline")
+savefig(pA2, "plot_A2_bottom40_four_scenarios.png")
+
+# Plot B — All quintiles, one panel per scenario
+pB = plot(layout=(2,2), size=(1400,900), dpi=150,
+          plot_title="Real Income by Quintile — All Scenarios",
+          plot_titlefontsize=11)
+for (si, (sol, lab)) in enumerate(zip(sc_sols, sc_labs))
+    for h in 1:H
+        plot!(pB[si], sol.t, sol[YDᴴ[h]] ./ sol0[YDᴴ[h]],
+              label="Q$h", color=colors_q[h], lw=2,
+              title=lab, xlabel="Years after reform",
+              ylabel=si==1 ? "Ratio to baseline" : "",
+              legend=si==1 ? :topright : false,
+              titlefontsize=9, guidefontsize=8, legendfontsize=7)
+    end
+    hline!(pB[si], [1.0], ls=:dot, color=:grey, lw=1.2, label="")
+end
+savefig(pB, "plot_B_quintiles_all_scenarios.png")
+
+# Plot C — CPI by quintile, all four scenarios side by side
+pC = plot(layout=(2,2), size=(1400,900), dpi=150,
+          plot_title="CPI by Quintile — All Scenarios",
+          plot_titlefontsize=11)
+for (si, (sol, lab)) in enumerate(zip(sc_sols, sc_labs))
+    for h in 1:H
+        plot!(pC[si], sol.t, sol[pᶜᴴ[h]] ./ sol0[pᶜᴴ[h]],
+              label="Q$h", color=colors_q[h], lw=2,
+              title=lab, xlabel="Years after reform",
+              ylabel=si==1 ? "Ratio to baseline" : "",
+              legend=si==1 ? :topleft : false,
+              titlefontsize=9, guidefontsize=8, legendfontsize=7)
+    end
+    hline!(pC[si], [1.0], ls=:dot, color=:grey, lw=1.2, label="")
+end
+savefig(pC, "plot_C_CPI_quintiles.png")
+
+# Plot D — Aggregate output, all four scenarios
+pD = plot(title="Aggregate Output — FOUR Scenarios",
+          xlabel="Years after reform", ylabel="Ratio to baseline",
+          lw=2.5, legend=:bottomleft, size=(800,500), dpi=150,
+          titlefontsize=11, guidefontsize=9, legendfontsize=8)
+for (sol, col, lab, ls) in zip(sc_sols, sc_cols, sc_labs, sc_ls)
+    plot!(pD, sol.t, sol[yₜ] ./ sol0[yₜ],
+          label=lab, color=col, lw=2.5, ls=ls)
+end
+hline!(pD, [1.0], ls=:dot, color=:grey, lw=1.5, label="Baseline")
+savefig(pD, "plot_D_aggregate_output.png")
+
+# Plot E — Government surplus, all four scenarios
+pE = plot(title="Government Fiscal Surplus — FOUR Scenarios",
+          xlabel="Years after reform", ylabel="Ratio to baseline",
+          lw=2.5, legend=:bottomright, size=(800,500), dpi=150,
+          titlefontsize=11, guidefontsize=9, legendfontsize=8)
+for (sol, col, lab, ls) in zip(sc_sols, sc_cols, sc_labs, sc_ls)
+    plot!(pE, sol.t, sol[SG] ./ sol0[SG],
+          label=lab, color=col, lw=2.5, ls=ls)
+end
+hline!(pE, [1.0], ls=:dot, color=:grey, lw=1.5, label="Baseline")
+savefig(pE, "plot_E_govt_surplus.png")
+
+# Plot L — Real consumption by quintile, all four scenarios
+pL = plot(layout=(2,2), size=(1400,900), dpi=150,
+          plot_title="Total Consumption by Quintile — All Scenarios",
+          plot_titlefontsize=11)
+for (si, (sol, lab)) in enumerate(zip(sc_sols, sc_labs))
+    base_c = [[sum(sol0[Cᴴ[j,h]][ti] for j in 1:N)
+               for ti in eachindex(sol0.t)] for h in 1:H]
+    shock_c= [[sum(sol[Cᴴ[j,h]][ti]  for j in 1:N)
+               for ti in eachindex(sol.t)]  for h in 1:H]
+    for h in 1:H
+        plot!(pL[si], sol.t, shock_c[h] ./ base_c[h],
+              label="Q$h", color=colors_q[h], lw=2,
+              title=lab, xlabel="Years after reform",
+              ylabel=si==1 ? "Ratio to baseline" : "",
+              legend=si==1 ? :topright : false,
+              titlefontsize=9, guidefontsize=8, legendfontsize=7)
+    end
+    hline!(pL[si], [1.0], ls=:dot, color=:grey, lw=1.2, label="")
+end
+savefig(pL, "plot_L_consumption_quintiles.png")
+
+# Plot M — Petroleum sector final price path (as ratio to pre-shock baseline)
+pM = plot(title="Petroleum Sector Final Price — Shock vs Baseline",
+          xlabel="Years after reform",
+          ylabel="Price relative to pre-shock baseline (t=0 = 1)",
+          lw=2.5, legend=:bottomright, size=(800,500), dpi=150,
+          titlefontsize=11, guidefontsize=9, legendfontsize=8)
+plot!(pM, sol0.t,   sol0[pᶠ[14]]   ./ sol0[pᶠ[14]][1],
+      label="Baseline (no reform)", color=:grey, lw=2, ls=:dot)
+plot!(pM, sol_s0.t, sol_s0[pᶠ[14]] ./ sol0[pᶠ[14]][1],
+      label="Shock (subsidy removal)", color=:crimson, lw=2.5)
+hline!(pM, [1.0], ls=:dot, color=:black, lw=1, label="")
+savefig(pM, "plot_M_petroleum_price.png")
+
+println("Main scenario plots saved (A–E, L, M).")
+
+# =============================================================================
+# TRANSMISSION MECHANISM PLOT
+# =============================================================================
+# Show the sequential unfolding of effects after the shock under S0:
+# 1. Petroleum final price jumps (pᶠ[14])
+# 2. Producer prices rise across sectors (aggregate pᶜ)
+# 3. Real income falls (YDᴴ[1] and YDᴴ[5])
+# 4. Output contracts (yₜ)
+
+# Normalise everything to t=0 of the shocked scenario
+pTX = plot(title="Transmission Mechanism — Fuel Subsidy Removal (S0: no transfer)",
+           xlabel="Years after reform",
+           ylabel="Ratio to pre-shock baseline",
+           lw=2.5, legend=:right, size=(950,560), dpi=150,
+           titlefontsize=11, guidefontsize=9, legendfontsize=8)
+
+# Petroleum final price
+plot!(pTX, sol_s0.t,
+      sol_s0[pᶠ[14]] ./ sol0[pᶠ[14]],
+      label="Petroleum final price (p¹⁴ᶠ)",
+      color=:firebrick, lw=2.5, ls=:solid)
+
+# Aggregate CPI
+plot!(pTX, sol_s0.t,
+      sol_s0[pᶜ] ./ sol0[pᶜ],
+      label="Aggregate CPI",
+      color=:darkorange, lw=2.5, ls=:dash)
+
+# Q1 CPI
+plot!(pTX, sol_s0.t,
+      sol_s0[pᶜᴴ[1]] ./ sol0[pᶜᴴ[1]],
+      label="Q1 consumer price index",
+      color=:goldenrod, lw=2, ls=:dot)
+
+# Q1 real income
+plot!(pTX, sol_s0.t,
+      sol_s0[YDᴴ[1]] ./ sol0[YDᴴ[1]],
+      label="Q1 real disposable income",
+      color=:royalblue, lw=2.5, ls=:solid)
+
+# Q5 real income
+plot!(pTX, sol_s0.t,
+      sol_s0[YDᴴ[5]] ./ sol0[YDᴴ[5]],
+      label="Q5 real disposable income",
+      color=:mediumpurple, lw=2, ls=:dash)
+
+# Aggregate output
+plot!(pTX, sol_s0.t,
+      sol_s0[yₜ] ./ sol0[yₜ],
+      label="Aggregate output",
+      color=:seagreen, lw=2.5, ls=:dashdot)
+
+hline!(pTX, [1.0], ls=:dot, color=:grey, lw=1.5, label="Baseline")
+savefig(pTX, "plot_TX_transmission_mechanism.png")
+println("Transmission mechanism plot saved.")
+
+# =============================================================================
+# IMPROVED SENSITIVITY PLOTS
+# =============================================================================
+
+# Fix: remap results_η to cleaned label
+results_η_clean = Dict(
+    "uniform -0.7"                 => results_η["uniform -0.7"],
+    "Eldeep-Zaki 2023 (baseline)"  => results_η["Eldeep-Zaki 2023 (baseline)"],
+    "Cockburn 2018 (uniform -2.0)" => results_η["Cockburn 2018 (uniform -2.0)"],
+    "Griffin 2016 (uniform -2.5)"  => results_η["Griffin 2016 (uniform -2.5)"],
+    "Breisinger 2018 (GTAP)"       => results_η["Breisinger 2018 (GTAP)"],
+)
+eta_order  = ["uniform -0.7", "Eldeep-Zaki 2023 (baseline)",
+              "Cockburn 2018 (uniform -2.0)", "Griffin 2016 (uniform -2.5)",
+              "Breisinger 2018 (GTAP)"]
+eta_colors = [:royalblue, :black, :seagreen, :crimson, :mediumpurple]
+eta_ls     = [:dash, :solid, :dashdot, :dot, :dashdotdot]
+
+# Plot F — Trade elasticity sensitivity, fixed labels
+pF = plot(title="Trade Elasticity Sensitivity — Q1 Real Income (S2: 0.4% GDP transfer)",
+          xlabel="Years after reform", ylabel="Ratio to baseline",
+          lw=2.5, legend=:bottomleft, size=(900,520), dpi=150,
+          titlefontsize=11, guidefontsize=9, legendfontsize=8)
+for (name, col, ls) in zip(eta_order, eta_colors, eta_ls)
+    plot!(pF, results_η_clean[name].t,
+          results_η_clean[name][YDᴴ[1]] ./ sol0[YDᴴ[1]],
+          label=name, color=col, lw=2.5, ls=ls)
+end
+hline!(pF, [1.0], ls=:dot, color=:grey, lw=1.5, label="Baseline")
+savefig(pF, "plot_F_trade_elasticity_sensitivity.png")
+
+# Plot G — βᵖ sensitivity, Q1, all four scenarios
+pG = plot(layout=(2,2), size=(1400,900), dpi=150,
+          plot_title="Price Adjustment Speed Sensitivity — Q1 Real Income (all scenarios)",
+          plot_titlefontsize=11)
+bp_labels = ["slow", "baseline", "fast"]
+bp_colors = [:seagreen, :black, :crimson]
+bp_ls2    = [:dot, :solid, :dash]
+for (si, (p_sc, sc_lab)) in enumerate(zip([p_s0, p_s1, p_s2, p_s3], sc_labs))
+    for (bp_name, col, ls) in zip(bp_labels, bp_colors, bp_ls2)
+        p_sens = copy(p_sc)
+        for j in 1:N; p_sens[βᵖ[j]] = bp_scenarios[bp_name][j]; end
+        sol_s = solve(ODEProblem(ESTEEM_ODE, u0, tspan, p_sens),
+                      Rosenbrock23(), saveat=1/12, abstol=1e-8, reltol=1e-6)
+        plot!(pG[si], sol_s.t, sol_s[YDᴴ[1]] ./ sol0[YDᴴ[1]],
+              label=si==1 ? "βᵖ $bp_name" : "",
+              color=col, lw=2, ls=ls,
+              title=sc_lab, xlabel="Years after reform",
+              ylabel=si==1 ? "Ratio to baseline" : "",
+              legend=si==1 ? :topright : false,
+              titlefontsize=9, guidefontsize=8, legendfontsize=7)
+    end
+    hline!(pG[si], [1.0], ls=:dot, color=:grey, lw=1.2, label="")
+end
+savefig(pG, "plot_G_bp_sensitivity.png")
+println("Sensitivity plots saved (F, G).")
+
+# =============================================================================
+# SECTORAL EFFECTS PLOTS
+# =============================================================================
+
+# Use S0 for sectoral effects — pure shock, no transfer confounding
+# Transfer goes to households not sectors, so results are identical
+# across shock scenarios, but S0 is the cleanest identification
+ti_end = length(sol_s0.t)
+y0_vec = [sol0[y[i]][1] for i in 1:N]
+
+price_change  = [sol_s0[pᵇ[i]][ti_end] / sol0[pᵇ[i]][ti_end] for i in 1:N]
+output_change = [sol_s0[y[i]][ti_end]  / sol0[y[i]][ti_end]   for i in 1:N]
+price_pct     = (price_change  .- 1) .* 100
+output_pct    = (output_change .- 1) .* 100
+
+shorten(s) = length(s) > 32 ? s[1:29] * "..." : s
+
+# Plot J — Grouped sectoral price change
+group_price = group_wavg(price_pct, y0_vec, sector_groups, group_order)
+pJ = bar(group_order, group_price,
+         title="Producer Price Changes by Sector Group\n(Fuel subsidy removal, t=5, output-weighted average)",
+         xlabel="", ylabel="% change vs baseline",
+         color=:steelblue, legend=false,
+         size=(1000,520), dpi=150,
+         titlefontsize=10, guidefontsize=8,
+         xrotation=38, bottom_margin=12Plots.mm,
+         left_margin=5Plots.mm)
+hline!(pJ, [0.0], color=:black, lw=1)
+savefig(pJ, "plot_J_grouped_price_change.png")
+
+# Plot K — Grouped sectoral output change
+group_output = group_wavg(output_pct, y0_vec, sector_groups, group_order)
+bar_colors   = ifelse.(group_output .>= 0, :seagreen, :crimson)
+pK = bar(group_order, group_output,
+         title="Output Changes by Sector Group\n(Fuel subsidy removal, t=5, output-weighted average)",
+         xlabel="", ylabel="% change vs baseline",
+         color=bar_colors, legend=false,
+         size=(1000,520), dpi=150,
+         titlefontsize=10, guidefontsize=8,
+         xrotation=38, bottom_margin=12Plots.mm,
+         left_margin=5Plots.mm)
+hline!(pK, [0.0], color=:black, lw=1)
+savefig(pK, "plot_K_grouped_output_change.png")
+
+println("\n=== GROUP OUTPUT & PRICE CHANGES (t=5, output-weighted) ===")
+for (g, op, pp) in zip(group_order, group_output, group_price)
+    @printf("%-28s │ output Δ=%6.2f%% │ price Δ=%6.2f%%\n", g, op, pp)
+end
+
+# Plot H — Top 15 most price-affected individual sectors
+sorted_p   = sortperm(price_pct, rev=true)
+top15p_idx = sorted_p[1:15]
+pH = bar(shorten.(sector_names[top15p_idx]), price_pct[top15p_idx],
+         title="Top 15 Sectors by Producer Price Increase\n(Fuel subsidy removal, t=5)",
+         xlabel="", ylabel="% change vs baseline",
+         color=:steelblue, legend=false,
+         size=(1000,560), dpi=150,
+         titlefontsize=10, guidefontsize=8,
+         xrotation=42, bottom_margin=12Plots.mm,
+         left_margin=5Plots.mm)
+hline!(pH, [0.0], color=:black, lw=1)
+savefig(pH, "plot_H_top15_price.png")
+
+# Plot I — Top 15 output losers
+sorted_o   = sortperm(output_pct)
+bot15_idx  = sorted_o[1:15]
+labels_i   = shorten.(sector_names[bot15_idx])
+values_i   = output_pct[bot15_idx]
+
+pI = bar(labels_i, values_i,
+         title="Top 15 Sectors by Output Contraction\n(Fuel subsidy removal, t=5)",
+         xlabel="", ylabel="% change vs baseline",
+         color=:crimson, legend=false,
+         size=(1100,640), dpi=150,
+         titlefontsize=10, guidefontsize=8,
+         xrotation=42,
+         bottom_margin=22Plots.mm,
+         left_margin=8Plots.mm,
+         top_margin=4Plots.mm)
+hline!(pI, [0.0], color=:black, lw=1)
+ylims!(pI, (-100, 5))
+
+# Wood-products artefact annotation
+wood_pos = findfirst(==(shorten("Wood products")), labels_i)
+if wood_pos !== nothing
+    annotate!(pI, wood_pos + 0.4, -45,
+              text("← data\nartefact*", :black, 8, :left))
+end
+
+# Footnote in reserved space below bars
+annotate!(pI, length(labels_i)/2 + 0.5, -95,
+          text("*Under-populated IO column in CAPMAS source; see methodology.",
+               :grey40, 7, :center))
+
+savefig(pI, "plot_I_top15_output.png")
+
+# =============================================================================
+# TABLES
+# =============================================================================
+
+# TABLE 1: Real Income Impact at t=5 (ratio to baseline)
+println("\n" * "="^70)
+println("TABLE 1: Real Income Impact at t=5 (ratio to baseline)")
+println("="^70)
+@printf("%-10s │ %-15s │ %-15s │ %-13s │ %-13s\n",
+        "Quintile", "S0: No transfer", "S1: Full savings",
+        "S2: 0.4% GDP", "S3: 0.25% GDP")
+println("─"^10 * "┼" * "─"^16 * "┼" * "─"^16 * "┼" * "─"^14 * "┼" * "─"^14)
+for h in 1:H
+    v0 = sol_s0[YDᴴ[h]][end] / sol0[YDᴴ[h]][end]
+    v1 = sol_s1[YDᴴ[h]][end] / sol0[YDᴴ[h]][end]
+    v2 = sol_s2[YDᴴ[h]][end] / sol0[YDᴴ[h]][end]
+    v3 = sol_s3[YDᴴ[h]][end] / sol0[YDᴴ[h]][end]
+    @printf("Q%-9d │ %15.4f │ %15.4f │ %13.4f │ %13.4f\n", h, v0, v1, v2, v3)
+end
+
+# TABLE 2: Transfer and Fiscal Summary at t=0
+println("\n" * "="^70)
+println("TABLE 2: Transfer and Fiscal Summary at t=0")
+println("="^70)
+@printf("%-25s │ %-15s │ %-12s │ %-12s\n",
+        "Scenario", "Transfer (bn EGP)", "% of GDP", "Q1 income t=5")
+println("─"^26 * "┼" * "─"^16 * "┼" * "─"^13 * "┼" * "─"^13)
+for (lab, sol) in zip(sc_labs, sc_sols)
+    st0   = sol[ST][1]   / 1e6
+    pct   = sol[ST][1]   / sol0[GDP][1] * 100
+    q1end = sol[YDᴴ[1]][end] / sol0[YDᴴ[1]][end]
+    @printf("%-25s │ %15.1f │ %12.2f │ %12.4f\n",
+            lab[1:min(24,length(lab))], st0, pct, q1end)
+end
+
+# TABLE 3: Top 10 Most Price-Affected Sectors at t=5
+println("\n" * "="^70)
+println("TABLE 3: Top 10 Most Price-Affected Sectors at t=5")
+println("="^70)
+@printf("%-35s │ %10s │ %12s │ %12s\n",
+        "Sector", "Pet. input %", "Price Δ (%)", "Output Δ (%)")
+println("─"^36 * "┼" * "─"^11 * "┼" * "─"^13 * "┼" * "─"^13)
+
+# petroleum input intensity = A[14, j] (row 14 of IO matrix = sector 14 inputs into j)
+pet_intensity = AA[14, :] .* 100   # as percentage of unit cost
+
+for rank in 1:10
+    i = sorted_p[rank]
+    @printf("%-35s │ %10.2f │ %12.2f │ %12.2f\n",
+            shorten(sector_names[i]),
+            pet_intensity[i],
+            price_pct[i],
+            output_pct[i])
+end
+
+# TABLE 3b: Consumption Decomposition at t=5 (S0) — Q5>Q1 mechanism
+println("\n" * "="^70)
+println("TABLE 3b: Consumption Decomposition at t=5 (S0) — Q5>Q1 mechanism")
+println("="^70)
+@printf("%-10s │ %-12s │ %-12s │ %-13s │ %-15s │ %-15s\n",
+        "Quintile", "Income Δ%", "Cons Δ%", "Disc share", "C with own disc", "C with Q1 disc")
+println("─"^10 * "┼" * "─"^13 * "┼" * "─"^13 * "┼" * "─"^14 * "┼" * "─"^16 * "┼" * "─"^16)
+for h in 1:H
+    yd_change = (sol_s0[YDᴴ[h]][end]/sol0[YDᴴ[h]][end] - 1)*100
+    c_change  = (sum(sol_s0[Cᴴ[j,h]][end] for j in 1:N) /
+                 sum(sol0[Cᴴ[j,h]][1] for j in 1:N) - 1)*100
+    own_disc = 1 - c0Q_tot[h]/sum(cQ[:,h])
+    q1_disc  = 1 - c0Q_tot[1]/sum(cQ[:,1])
+    c_predicted_own = yd_change * own_disc
+    c_predicted_q1  = yd_change * q1_disc
+    @printf("Q%-9d │ %12.2f │ %12.2f │ %14.3f │ %16.2f │ %16.2f\n",
+            h, yd_change, c_change, own_disc, c_predicted_own, c_predicted_q1)
+end
+println("\nLast two columns show LES decomposition: c_loss ≈ income_loss × discretionary_share.")
+println("Convergence of column 5 to column 6 (when Q1 disc share is used) confirms the")
+println("Q5>Q1 consumption gap is driven by discretionary-share differences from IFPRI subsistence data.")
+
+# TABLE 3c: Sector-Group Petroleum Exposure
+println("\n" * "="^70)
+println("TABLE 3c: Sector-Group Petroleum Exposure")
+println("="^70)
+for g in group_order
+    idxs = sector_groups[g]
+    pet_share = sum(AA[14, idxs] .* yy[idxs]) / sum(yy[idxs]) * 100
+    @printf("%-30s │ pet input share = %5.2f%%\n", g, pet_share)
+end
+
+# TABLE 4: Sensitivity Summary — Q1 Real Income at t=5 (S2: 0.4% GDP, IMF commitment)
+println("\n" * "="^70)
+println("TABLE 4: Sensitivity Summary — Q1 Real Income at t=5 (S2: 0.4% GDP, IMF commitment)")
+println("="^70)
+println("\nPanel A: βᵖ × βʸ grid")
+@printf("%-20s │ βᵖ fast │ βᵖ baseline │ βᵖ slow\n", "")
+println("─"^21 * "┼─────────┼─────────────┼────────")
+for by_name in ["fast", "baseline", "slow"]
+    row = Float64[]
+    for bp_name in ["fast", "baseline", "slow"]
+        p_g = copy(p_s2)
+        for j in 1:N
+            p_g[βᵖ[j]] = bp_scenarios[bp_name][j]
+            p_g[βʸ[j]] = by_scenarios[by_name][j]
+        end
+        sg = solve(ODEProblem(ESTEEM_ODE, u0, tspan, p_g),
+                   Rosenbrock23(), saveat=1/12, abstol=1e-8, reltol=1e-6)
+        push!(row, ratio(sg, 1))
+    end
+    @printf("βʸ %-17s │  %.4f  │    %.4f   │  %.4f\n",
+            by_name, row[1], row[2], row[3])
+end
+
+println("\nPanel B: Markup sensitivity (μ₁)")
+@printf("%-25s │   Q1   │   Q5\n", "Scenario")
+println("─"^26 * "┼────────┼────────")
+for name in ["pure cost-push (0.0)", "baseline (0.1)", "high markup (0.5)"]
+    @printf("%-25s │ %.4f │ %.4f\n",
+            name, ratio(results_mu[name], 1), ratio(results_mu[name], 5))
+end
+
+println("\nPanel C: Trade elasticities")
+@printf("%-35s │   Q1   │   Q5\n", "Scenario")
+println("─"^36 * "┼────────┼────────")
+for name in eta_order
+    @printf("%-35s │ %.4f │ %.4f\n",
+            name,
+            results_η_clean[name][YDᴴ[1]][end] / sol0[YDᴴ[1]][end],
+            results_η_clean[name][YDᴴ[5]][end] / sol0[YDᴴ[5]][end])
+end
+
+println("\nAll tables printed.")
+
+# =============================================================================
+# FULL GRID: trade elasticities × price adjustment speeds (Antoine's request)
+# =============================================================================
+
+println("\nRunning full sensitivity grid (η × βᵖ)...")
+
+eta_names_grid = [
+    "uniform -0.7",
+    "Eldeep-Zaki 2023 (baseline)",
+    "Cockburn 2018 (uniform -2.0)",
+    "Griffin 2016 (uniform -2.5)",
+    "Breisinger 2018 (GTAP)",
+]
+bp_names_grid = ["slow", "baseline", "fast"]
+
+grid_results = Dict()
+
+for eta_name in eta_names_grid
+    for bp_name in bp_names_grid
+
+        # Set trade elasticities
+        if eta_name == "Eldeep-Zaki 2023 (baseline)"
+            η_vec_x = ηˣ_vec
+            η_vec_m = ηᴹ_vec
+        elseif eta_name == "Breisinger 2018 (GTAP)"
+            η_vec_x = ηˣ_br
+            η_vec_m = ηˣ_br
+        elseif eta_name == "uniform -0.7"
+            η_vec_x = fill(-0.7, N)
+            η_vec_m = fill(-0.7, N)
+        elseif eta_name == "Cockburn 2018 (uniform -2.0)"
+            η_vec_x = fill(-2.0, N)
+            η_vec_m = fill(-2.0, N)
+        elseif eta_name == "Griffin 2016 (uniform -2.5)"
+            η_vec_x = fill(-2.5, N)
+            η_vec_m = fill(-2.5, N)
+        end
+
+        ζˣ_s = xx ./ max.(1 .+ tY, 1e-4).^η_vec_x
+        ζᴹ_s = sigmaM .* max.(1 .+ tM,  1e-4).^(-η_vec_m)
+
+        p_grid = copy(p_s2)
+        for j in 1:N
+            p_grid[ηˣ[j]] = η_vec_x[j]
+            p_grid[ηᴹ[j]] = η_vec_m[j]
+            p_grid[ζˣ[j]] = ζˣ_s[j]
+            p_grid[ζᴹ[j]] = ζᴹ_s[j]
+            p_grid[βᵖ[j]] = bp_scenarios[bp_name][j]
+        end
+
+        sol_grid = solve(ODEProblem(ESTEEM_ODE, u0, tspan, p_grid),
+                         Rosenbrock23(), saveat=1/12, abstol=1e-8, reltol=1e-6)
+
+        grid_results[(eta_name, bp_name)] = sol_grid
+        println("  η=$(eta_name[1:min(25,end)]) × βᵖ=$bp_name → Q1=$(round(ratio(sol_grid,1), digits=4))  Q5=$(round(ratio(sol_grid,5), digits=4))")
+    end
+end
+
+# --- Print table ---
+println("\n=== FULL GRID: Q1 Real Income at t=5 (S2) ===")
+@printf("%-35s │ βᵖ slow │ βᵖ baseline │ βᵖ fast\n", "Trade elasticity")
+println("─"^36 * "┼─────────┼─────────────┼─────────")
+for eta_name in eta_names_grid
+    row = [ratio(grid_results[(eta_name, bp)], 1) for bp in bp_names_grid]
+    @printf("%-35s │  %.4f  │   %.4f    │  %.4f\n",
+            eta_name[1:min(34,end)], row[1], row[2], row[3])
+end
+
+# --- Qualitative robustness check ---
+println("\n=== Qualitative check ===")
+n_below = sum(ratio(grid_results[(e,b)], 1) < 1.0
+              for e in eta_names_grid for b in bp_names_grid)
+println("Combinations where Q1 < baseline: $n_below / $(length(eta_names_grid)*length(bp_names_grid))")
+
+# --- Heatmap plot — fixed alignment and margins ---
+grid_matrix = [ratio(grid_results[(e,b)], 1)
+               for e in eta_names_grid, b in bp_names_grid]
+
+short_eta = [
+    "Uniform −0.7",
+    "Eldeep-Zaki 2023\n(baseline)",
+    "Cockburn 2018 (−2.0)",
+    "Griffin 2016 (−2.5)",
+    "Breisinger 2018 (GTAP)",
+]
+short_bp = ["βᵖ slow", "βᵖ baseline", "βᵖ fast"]
+
+nrows, ncols = size(grid_matrix)
+
+pGrid = heatmap(
+    1:ncols, 1:nrows, grid_matrix,
+    title="Q1 Real Income at t=5 — Sensitivity Grid\n(S2: 0.4% GDP transfer; all values < 1.0)",
+    xlabel="Price adjustment speed",
+    ylabel="Trade elasticity assumption",
+    c=cgrad(:Reds, rev=true),
+    clims=(0.88, 0.96),
+    xticks=(1:ncols, short_bp),
+    yticks=(1:nrows, short_eta),
+    size=(1150, 600),
+    dpi=150,
+    titlefontsize=11,
+    guidefontsize=10,
+    tickfontsize=9,
+    left_margin=28Plots.mm,
+    right_margin=8Plots.mm,
+    bottom_margin=10Plots.mm,
+    top_margin=8Plots.mm,
+    colorbar_title="Q1 income ratio",
+    xlims=(0.5, ncols + 0.5),
+    ylims=(0.5, nrows + 0.5),
+)
+
+for i in 1:nrows, j in 1:ncols
+    val = grid_matrix[i, j]
+    col = val < 0.915 ? :white : :black
+    annotate!(pGrid, j, i, text(string(round(val, digits=3)), col, 10, :center))
+end
+
+savefig(pGrid, "plot_sensitivity_grid.png")
+println("Full sensitivity grid heatmap saved.")
+
+# =============================================================================
+# PROPAGATION PLOTS — adapted from Rwanda ESTEEM
+# Scenario: S0 (pure shock, no transfer) — cleanest propagation story
+# Three figures: (1) Households  (2) X & M  (3) Y & Pᶠ
+# =============================================================================
+
+shocksol = sol_s0   # change to sol_s2 if you want the transfer scenario
+
+group_idxs = [sector_groups[g] for g in group_order]   # 12 groups, fixed order
+ngrp = length(group_order)
+cols = palette(:default)[1:ngrp]
+
+# aggregate a sector-indexed variable into the 12 groups → matrix [time × group]
+agg_group(var, sol) = hcat([sum(sol[var[i]] for i in idx) for idx in group_idxs]...)
+
+# generic stacked positive/negative contribution panel
+function contrib_panel(t, contrib, names, colrs; ttl, ylab, withtotal=false)
+    pos = max.(contrib, 0);  neg = min.(contrib, 0)
+    pstack = cumsum(pos, dims=2);  nstack = cumsum(neg, dims=2)
+    g = plot(title=ttl, ylabel=ylab, legend=:outerright,
+             titlefontsize=10, legendfontsize=7)
+    for j in 1:length(names)
+        fp = j == 1 ? zeros(size(pstack,1)) : pstack[:, j-1]
+        fn = j == 1 ? zeros(size(nstack,1)) : nstack[:, j-1]
+        plot!(g, t, pstack[:, j], fillrange=fp, lw=0, color=colrs[j], label=names[j])
+        plot!(g, t, nstack[:, j], fillrange=fn, lw=0, color=colrs[j], label="")
+    end
+    hline!(g, [0.0], color=:black, ls=:dash, label="")
+    return g
+end
+
+# =============================================================================
+# FIGURE 1 — HOUSEHOLDS: CPI, real income, real consumption per capita
+# =============================================================================
+hh_labels = ["Q1" "Q2" "Q3" "Q4" "Q5"]
+hh_colors = [:royalblue :seagreen :darkorange :mediumpurple :crimson]
+
+pCH0 = hcat([sol0[pᶜᴴ[h]]     for h in 1:H]...)
+pCH1 = hcat([shocksol[pᶜᴴ[h]] for h in 1:H]...)
+YD0  = hcat([sol0[YDᴴ[h]]     for h in 1:H]...)
+YD1  = hcat([shocksol[YDᴴ[h]] for h in 1:H]...)
+C0h  = hcat([[sum(sol0[Cᴴ[j,h]][ti]     for j in 1:N) / POPQ[h] for ti in eachindex(sol0.t)]     for h in 1:H]...)
+C1h  = hcat([[sum(shocksol[Cᴴ[j,h]][ti] for j in 1:N) / POPQ[h] for ti in eachindex(shocksol.t)] for h in 1:H]...)
+
+pCH_pct = 100 .* (pCH1 ./ pCH0 .- 1)
+YD_pct  = 100 .* (YD1  ./ YD0  .- 1)
+C_pct   = 100 .* (C1h  ./ C0h  .- 1)
+
+g_hh_p  = plot(sol0.t, pCH_pct, lw=2, label=hh_labels, color=hh_colors,
+    title="Consumption price index pᶜᴴ", ylabel="% deviation", legend=:topright)
+hline!(g_hh_p, [0.0], color=:black, ls=:dash, label="")
+
+g_hh_yd = plot(sol0.t, YD_pct, lw=2, label=hh_labels, color=hh_colors,
+    title="Real disposable income per cap", legend=:bottomright)
+hline!(g_hh_yd, [0.0], color=:black, ls=:dash, label="")
+
+g_hh_c  = plot(sol0.t, C_pct, lw=2, label=hh_labels, color=hh_colors,
+    title="Real consumption per cap", legend=:bottomright)
+hline!(g_hh_c, [0.0], color=:black, ls=:dash, label="")
+
+fig_households = plot(g_hh_p, g_hh_yd, g_hh_c, layout=(1,3),
+    size=(1400,450), legendfontsize=8,
+    plot_title="Household outcomes — S0 fuel subsidy removal")
+savefig(fig_households, "plot_prop_1_households.png")
+
+# =============================================================================
+# FIGURE 2 — EXTERNAL: Exports X and Imports M (% change + contributions)
+# =============================================================================
+X0 = agg_group(x, sol0);  X1 = agg_group(x, shocksol)
+M0 = agg_group(m, sol0);  M1 = agg_group(m, shocksol)
+
+X_pct = 100 .* (X1 ./ X0 .- 1)
+M_pct = 100 .* (M1 ./ M0 .- 1)
+X_contrib = 100 .* (X1 .- X0) ./ sum(X0, dims=2)
+M_contrib = 100 .* (M1 .- M0) ./ sum(M0, dims=2)
+
+g_X = plot(sol0.t, X_pct, lw=2, label=reshape(group_order,1,:),
+    title="X: % ch.", ylabel="% deviation", legend=:outerright,
+    titlefontsize=10, legendfontsize=7)
+hline!(g_X, [0.0], color=:black, ls=:dash, label="")
+
+g_X_c = contrib_panel(sol0.t, X_contrib, group_order, cols;
+    ttl="X: contrib.", ylab="percentage points")
+
+g_M = plot(sol0.t, M_pct, lw=2, label=reshape(group_order,1,:),
+    title="M: % ch.", ylabel="% deviation", legend=false, titlefontsize=10)
+hline!(g_M, [0.0], color=:black, ls=:dash, label="")
+
+g_M_c = contrib_panel(sol0.t, M_contrib, group_order, cols;
+    ttl="M: contrib.", ylab="percentage points")
+
+fig_trade = plot(g_X, g_X_c, g_M, g_M_c, layout=(2,2), size=(1300,750))
+savefig(fig_trade, "plot_prop_2_trade.png")
+
+# =============================================================================
+# FIGURE 3 — PRODUCTION: Output Y and final price Pᶠ (% change + contributions)
+# =============================================================================
+Y0 = agg_group(y, sol0);  Y1 = agg_group(y, shocksol)
+Y_pct = 100 .* (Y1 ./ Y0 .- 1)
+Y_contrib = 100 .* (Y1 .- Y0) ./ sum(Y0, dims=2)
+
+g_Y = plot(sol0.t, Y_pct, lw=2, label=reshape(group_order,1,:),
+    title="Y: % ch.", ylabel="% deviation", legend=:outerright,
+    titlefontsize=10, legendfontsize=7)
+hline!(g_Y, [0.0], color=:black, ls=:dash, label="")
+
+g_Y_c = contrib_panel(sol0.t, Y_contrib, group_order, cols;
+    ttl="Y: contrib.", ylab="% deviation")
+# overlay black total line (sum of contributions = aggregate % change)
+Y_total = 100 .* (sum(Y1, dims=2) ./ sum(Y0, dims=2) .- 1)
+plot!(g_Y_c, sol0.t, vec(Y_total), color=:black, lw=2, label="total")
+
+# Pᶠ: consumption-share-weighted within each group (Rwanda's agg_price_pf logic)
+function agg_pf(sol)
+    hcat([begin
+        cmat = hcat([sol0[cₐ[i]] for i in idx]...)        # baseline cₐ weights
+        wts  = cmat ./ vec(sum(cmat, dims=2))
+        pmat = hcat([sol[pᶠ[i]] for i in idx]...)
+        vec(sum(wts .* pmat, dims=2))
+    end for idx in group_idxs]...)
+end
+pf0 = agg_pf(sol0);  pf1 = agg_pf(shocksol)
+pf_pct = 100 .* (pf1 ./ pf0 .- 1)
+
+g_pf = plot(sol0.t, pf_pct, lw=2, label=reshape(group_order,1,:),
+    title="Pᶠ: % ch.", ylabel="% deviation", legend=false, titlefontsize=10)
+hline!(g_pf, [0.0], color=:black, ls=:dash, label="")
+
+# Pᶠ contribution: sector price change weighted by baseline consumption value share
+C0all = hcat([sol0[cₐ[i]]     for i in 1:N]...)
+pf0all = hcat([sol0[pᶠ[i]]     for i in 1:N]...)
+pf1all = hcat([shocksol[pᶠ[i]] for i in 1:N]...)
+pf_sec_contrib = 100 .* C0all .* (pf1all .- pf0all) ./ sum(C0all .* pf0all, dims=2)
+pf_grp_contrib = hcat([vec(sum(pf_sec_contrib[:, idx], dims=2)) for idx in group_idxs]...)
+
+g_pf_c = areaplot(sol0.t, pf_grp_contrib, stack=true, lw=0,
+    label=reshape(group_order,1,:), title="Pᶠ: contrib.",
+    ylabel="percentage points", legend=:outerright,
+    titlefontsize=10, legendfontsize=7)
+hline!(g_pf_c, [0.0], color=:black, ls=:dash, label="")
+
+fig_production = plot(g_Y, g_Y_c, g_pf, g_pf_c, layout=(2,2), size=(1300,750))
+savefig(fig_production, "plot_prop_3_production.png")
+
+println("Propagation plots saved: households, trade, production.")
+
